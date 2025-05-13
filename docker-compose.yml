@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  db:
+    image: mariadb:10.5
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: rcvo
+    volumes:
+      - ./rcvo.sql:/docker-entrypoint-initdb.d/rcvo.sql
+    ports:
+      - "3306:3306"
+
+  api:
+    image: node:18
+    working_dir: /usr/src/app
+    volumes:
+      - ./:/usr/src/app
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - DB_HOST=db
+      - DB_USER=root
+      - DB_PASS=rootpw
+      - DB_NAME=rcvo
+      - JWT_SECRET=testsecret
+    command: sh -c "npm install --silent && node index.js"
+    depends_on:
+      - db

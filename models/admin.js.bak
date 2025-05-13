@@ -1,0 +1,11 @@
+// /opt/rcvo/src/api/models/admin.js
+const db = require('../db'); /** * Récupère un admin par son email. * @param {string} email * @returns {Promise<object|null>} */ async function getAdminByEmail(email) { const query = 
+  'SELECT id, email, hashedPassword FROM admins WHERE email = ?'; const [rows] = await db.execute(query, [email]); return rows[0] || null;
+}
+/** * Ajoute un nouvel admin en base et retourne ses infos. * @param {string} email * @param {string} hashedPassword * @returns {Promise<object>} */ async function addAdmin(email, 
+hashedPassword) {
+  const insertQuery = 'INSERT INTO admins (email, hashedPassword) VALUES (?, ?)'; await db.execute(insertQuery, [email, hashedPassword]); const selectQuery = 'SELECT id, email FROM 
+  admins WHERE email = ?'; const [rows] = await db.execute(selectQuery, [email]); return rows[0];
+}
+module.exports = { getAdminByEmail, addAdmin,
+};
