@@ -1,5 +1,5 @@
 /**
- * RCVO API - index.js
+ * RCVO API – index.js
  * Version simplifiée et fonctionnelle
  */
 
@@ -8,121 +8,82 @@ const helmet = require('helmet');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const jwt = require('jsonwebtoken');
-const mysql = require('mysql2/promise');
-const AWS = require('aws-sdk');
+// const mysql = require('mysql2/promise'); // décommentez si vous utilisez MariaDB/MySQL
+// const AWS = require('aws-sdk');          // décommentez si vous utilisez AWS (SES, etc.)
 
-// Charger .env
-dotenv.config({ path: '/opt/rcvo/src/api/.env' });
+// Charger les variables d’environnement depuis /opt/rcvo/src/api/.env (ou .env à la racine)
+dotenv.config({ path: process.env.NODE_ENV === 'production'
+  ? '/opt/rcvo/src/api/.env'
+  : '.env'
+});
 
 const app = express();
 app.use(helmet());
-app.use(cors());
+app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
 
-// Connexion MariaDB
-let db;
-(async () => {
-  db = await mysql.createPool({
-    host: process.env.DB_HOST,
-    port: +process.env.DB_PORT,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASS,
-    database: process.env.DB_NAME,
-    waitForConnections: true,
-    connectionLimit: 10,
-  });
-})();
+// —————————————————————————————————————————
+// Connexion à la base (exemple MariaDB) — décommentez si nécessaire
+// let db;
+// (async () => {
+//   db = await mysql.createPool({
+//     host:     process.env.DB_HOST,
+//     port:     process.env.DB_PORT,
+//     user:     process.env.DB_USER,
+//     password: process.env.DB_PASS,
+//     database: process.env.DB_NAME,
+//     waitForConnections: true,
+//     connectionLimit: 10,
+//   });
+// })();
 
-// Config AWS SES
-const ses = new AWS.SES({ region: 'eu-west-3' });
-
+// —————————————————————————————————————————
 // Route de santé
-app.get('/api/sync/health', (req, res) => {
+app.get('/api/sync/health', (_req, res) => {
   res.status(200).json({ status: 'OK' });
 });
 
-// Exemple d’enregistrement d’un admin (simplifié)
+// Route de connexion
+app.post('/api/admin/login', async (req, res) => {
+  const { email, password } = req.body;
+  try {
+    // — Votre logique de lookup et de comparaison de mot de passe
+    // const [rows] = await db.query('SELECT * FROM admin WHERE email = ?', [email]);
+    // if (rows.length === 0 || !await bcrypt.compare(password, rows[0].hash)) {
+    //   return res.status(401).json({ message: 'Identifiants invalides' });
+    // }
+
+    // Pour test statique :
+    if (email === 'test@example.com' && password === '123456') {
+      // Créez un JWT réel ici si besoin :
+      const token = jwt.sign({ email }, process.env.JWT_SECRET || 'secret', { expiresIn: '1h' });
+      return res.status(200).json({ token });
+    }
+
+    return res.status(401).json({ message: 'Identifiants invalides' });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Erreur serveur' });
+  }
+});
+
+// Route d’inscription
 app.post('/api/admin/register', async (req, res) => {
+  const { email, password } = req.body;
   try {
-    const { email, password } = req.body;
-    // Ici, hasher le mot de passe en prod…
-    const [result] = await db.execute(
-      'INSERT INTO admins (email, password) VALUES (?, ?)',
-      [email, password]
-    );
-    return res.status(201).json({ id: result.insertId, email });
+    // — Votre logique d’enregistrement (hash du mot de passe, INSERT en base, etc.)
+    // const hash = await bcrypt.hash(password, 10);
+    // await db.query('INSERT INTO admin (email, hash) VALUES (?, ?)', [email, hash]);
+    return res.status(201).json({ message: 'Utilisateur créé' });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: 'Erreur interne' });
+    return res.status(500).json({ message: 'Erreur serveur' });
   }
 });
 
-// Confirmation de compte admin
-app.post('/api/admin/confirm', async (req, res) => {
-  const { token } = req.body;
-  try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    await db.execute(
-      'UPDATE admins SET confirmed = TRUE WHERE id = ?',
-      [payload.sub]
-    );
-    return res.json({ message: 'Compte confirmé' });
-  } catch (err) {
-    console.error(err);
-    return res.status(400).json({ error: 'Token invalide' });
-  }
+// Démarrage du serveur
+const PORT = process.env.PORT || 8081;
+app.listen(PORT, () => {
+  console.log(`API RCVO démarrée sur le port ${PORT}`);
 });
 
-// Envoi de mail de confirmation (simplifié)
-app.post('/api/admin/send-confirm/:id', async (req, res) => {
-  const adminId = req.params.id;
-  try {
-    // Récupérer l’admin
-    const [rows] = await db.execute(
-      'SELECT email FROM admins WHERE id = ?',
-      [adminId]
-    );
-    if (!rows.length) return res.status(404).json({ error: 'Admin non trouvé' });
-    const email = rows[0].email;
-    // Générer token
-    const confirmToken = jwt.sign({ sub: adminId }, process.env.JWT_SECRET, {
-      expiresIn: '24h',
-    });
-    const confirmUrl =
-      'https://' +
-      process.env.API_HOST + // définie dans .env si nécessaire
-      '/confirm.html?token=' +
-      confirmToken;
-
-    // Préparer email
-    const emailParams = {
-      Destination: { ToAddresses: [email] },
-      Message: {
-        Subject: { Data: 'Confirmez votre compte Admin Rcvo' },
-        Body: {
-          Text: {
-            Data:
-              'Bonjour,\n\n' +
-              'Cliquez sur ce lien pour activer votre compte administrateur : ' +
-              confirmUrl +
-              '\n\n' +
-              'Ce lien expire dans 24 heures.',
-          },
-        },
-      },
-      Source: 'noreply@rcvo-crm-auto.com',
-    };
-
-    await ses.sendEmail(emailParams).promise();
-    return res.status(200).json({ message: 'Email envoyé à ' + email });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Impossible d’envoyer l’email' });
-  }
-});
-
-// Démarrage
-const port = +process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`RCVO API démarrée sur le port ${port}`);
-});
