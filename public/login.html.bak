@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <title>Connexion – RCVO</title>
+  <style>
+    body { font-family: sans-serif; margin: 0; padding: 2rem; }
+    nav { background: #007BFF; padding: 1rem; }
+    nav a { color: #fff; margin-right: 1rem; text-decoration: none; }
+    form { max-width: 300px; margin-top: 2rem; }
+    label, input { display: block; width: 100%; margin-bottom: .5rem; }
+    button { padding: .5rem 1rem; background: #007BFF; color: #fff; border: none; }
+    #error { color: red; margin-top: 1rem; }
+  </style>
+</head>
+<body>
+
+  <nav>
+    <a href="index.html">Accueil</a>
+    <a href="login.html">Connexion</a>
+    <a href="register.html">Inscription</a>
+  </nav>
+
+  <h1>Connexion</h1>
+  <form id="loginForm">
+    <label for="email">Email :</label>
+    <input id="email" type="email" required />
+    <label for="password">Mot de passe :</label>
+    <input id="password" type="password" required />
+    <button type="submit">Se connecter</button>
+  </form>
+  <div id="error"></div>
+
+  <script>
+    document.getElementById('loginForm').addEventListener('submit', async e => {
+      e.preventDefault();
+      document.getElementById('error').textContent = '';
+      const email = document.getElementById('email').value;
+      const password = document.getElementById('password').value;
+      try {
+        const res = await fetch(
+          'https://Rcvo-Backend-env.eba-k3tjwhr3.eu-west-3.elasticbeanstalk.com/api/admin/login',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password })
+          }
+        );
+        if (!res.ok) {
+          const txt = await res.text();
+          throw new Error(txt || res.statusText);
+        }
+        window.location.href = 'index.html';
+      } catch (err) {
+        document.getElementById('error').textContent =
+          err.message || 'Erreur de connexion';
+      }
+    });
+  </script>
+
+</body>
+</html>

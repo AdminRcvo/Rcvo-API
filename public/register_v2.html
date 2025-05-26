@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <title>Inscription – RCVO</title>
+  <style>
+    body { font-family:sans-serif; margin:0; padding:2rem; }
+    nav { background:#007BFF; padding:1rem; }
+    nav a { color:#fff; margin-right:1rem; text-decoration:none; }
+    main { max-width:320px; margin:2rem auto; }
+    .error { color:red; }
+    .pwd-wrap { position: relative; display:flex; }
+    .pwd-wrap button { background:none; border:none; cursor:pointer; margin-left:-2rem; }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="index.html">Accueil</a>
+    <a href="login_v2.html">Connexion</a>
+    <a href="register_v2.html">Inscription</a>
+  </nav>
+  <main>
+    <h1>Inscription</h1>
+    <form id="form">
+      <label>
+        Email<br>
+        <input type="email" name="email" required>
+      </label><br>
+      <label>
+        Mot de passe<br>
+        <div class="pwd-wrap">
+          <input type="password" name="password" required>
+          <button type="button" id="toggle">👁️</button>
+        </div>
+      </label><br>
+      <button type="submit">S’inscrire</button>
+    </form>
+    <p class="error" id="err"></p>
+  </main>
+  <script>
+    console.log('[register] script chargé');
+    // toggle œil
+    document.getElementById('toggle').onclick = () => {
+      const p = document.querySelector('[name="password"]');
+      p.type = p.type==='password'?'text':'password';
+    };
+    // soumission
+    document.getElementById('form').onsubmit = async e => {
+      e.preventDefault();
+      console.log('[register] form submitted');
+      const err = document.getElementById('err');
+      err.textContent = '';
+      const email = e.target.email.value;
+      const password = e.target.password.value;
+      try {
+        const res = await fetch('/api/admin/register', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({email,password})
+        });
+        console.log('[register] status', res.status);
+        if (!res.ok) {
+          err.textContent = `Erreur ${res.status}`;
+          return;
+        }
+        window.location.href = 'login_v2.html';
+      } catch (e) {
+        console.error('[register] fetch error', e);
+        err.textContent = 'NetworkError';
+      }
+    };
+  </script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - echo "Pas d'installation"
+    build:
+      commands:
+        - echo "Pas de build"
+  artifacts:
+    baseDirectory: "/"
+    files:
+      - "**/*"
+  cache:
+    paths: []
+  customRules:
+    - source: "/api/<*>"
+      target: "https://Rcvo-Backend-env.eba-k3tjwhr3.eu-west-3.elasticbeanstalk.com/api/<*>"
+      status: 200
+      condition: null
