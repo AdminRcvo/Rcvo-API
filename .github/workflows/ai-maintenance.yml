@@ -1,0 +1,50 @@
+# Ce workflow doit être placé dans le repo contenant ton API (par ex. AdminRcvo/API) sous `.github/workflows/ai-maintenance.yml`
+name: AI Code Maintenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      change_request:
+        description: 'Décris la modification à appliquer'
+        required: true
+
+jobs:
+  apply_ai_patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Install OpenAI CLI
+        run: npm install -g openai
+
+      - name: Generate patch with OpenAI
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          openai api chat.completions.create \
+            -m gpt-4 \
+            -p "Agis comme un développeur : ${{ github.event.inputs.change_request }}, fournis-moi un patch git (diff) à appliquer sur ce repo." \
+            > patch.diff
+
+      - name: Apply patch & commit
+        run: |
+          git apply patch.diff
+          git checkout -b ai-update
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "AI update: ${{ github.event.inputs.change_request }}"
+          git push -u origin ai-update
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "AI update: ${{ github.event.inputs.change_request }}"
+          title: "🛠 AI update: ${{ github.event.inputs.change_request }}"
+          body: |
+            Ce PR contient les modifications générées par l’IA pour :
+            > ${{ github.event.inputs.change_request }}
+          base: main
+          head: ai-update
