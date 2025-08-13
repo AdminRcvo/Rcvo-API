@@ -30,8 +30,15 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Installer dépendances
-        run: npm ci
+      - name: Installer dépendances (ci si lockfile, sinon install)
+  run: |
+    if [ -f package-lock.json ]; then
+      npm ci
+    else
+      echo "⚠️ package-lock.json absent → npm install"
+      npm install
+    fi
+
 
       - name: Construire projet
         run: npm run build --if-present
