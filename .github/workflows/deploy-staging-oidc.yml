@@ -1,0 +1,87 @@
+name: Deploy STAGING via OIDC
+
+on:
+  push:
+    branches: [ main ]    # déploie à chaque push sur main
+  workflow_dispatch:       # et manuel
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-west-3
+  EB_APP_NAME: rcvo-backend
+  EB_ENV_NAME: Rcvo-Backend-staging
+  BASE_SCHEME: http       # passera à https après config TLS
+  HEALTH_PATH: /health
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Elastic Beanstalk CLI
+        run: pip install --upgrade awsebcli
+
+      - name: EB init (non-interactive)
+        run: |
+          printf "n\n" | eb init "$EB_APP_NAME" \
+            --platform "Node.js 22 running on 64bit Amazon Linux 2023" \
+            --region "$AWS_REGION"
+          eb use "$EB_ENV_NAME"
+
+      - name: Deploy to STAGING (EB CLI)
+        run: |
+          eb deploy "$EB_ENV_NAME" --staged --timeout 40
+
+      - name: Enforce EB settings (port + healthcheck)
+        run: |
+          aws elasticbeanstalk update-environment \
+            --environment-name "$EB_ENV_NAME" \
+            --option-settings \
+              Namespace=aws:elasticbeanstalk:environment:process:default,OptionName=Port,Value=8080 \
+              Namespace=aws:elasticbeanstalk:environment:process:default,OptionName=HealthCheckPath,Value=${{ env.HEALTH_PATH }}
+
+      - name: Wait ready/green
+        run: |
+          for i in {1..120}; do
+            read STATUS HEALTH ABRT <<<"$(aws elasticbeanstalk describe-environments \
+              --environment-names "$EB_ENV_NAME" \
+              --query "Environments[0].[Status,Health,AbortableOperationInProgress]" \
+              --output text)"
+            echo "Status=$STATUS Health=$HEALTH Abortable=$ABRT"
+            [ "$STATUS" = "Ready" ] && [ "$ABRT" = "false" ] && break
+            sleep 10
+          done
+          for i in {1..80}; do
+            HEALTH=$(aws elasticbeanstalk describe-environments \
+              --environment-names "$EB_ENV_NAME" \
+              --query "Environments[0].Health" --output text)
+            echo "Health=$HEALTH"
+            [ "$HEALTH" = "Green" ] && exit 0
+            sleep 10
+          done
+          echo "STAGING not Green in time"; exit 1
+
+      - name: Smoke test /health (HTTP)
+        run: |
+          URL="${{ env.BASE_SCHEME }}://$(aws elasticbeanstalk describe-environments \
+            --environment-names "$EB_ENV_NAME" \
+            --query "Environments[0].CNAME" --output text)"
+          echo "Testing $URL${{ env.HEALTH_PATH }}"
+          for i in {1..20}; do
+            code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL${{ env.HEALTH_PATH }}")
+            echo "-> $code"
+            [ "$code" = "200" ] && exit 0
+            sleep 3
+          done
+          exit 1
