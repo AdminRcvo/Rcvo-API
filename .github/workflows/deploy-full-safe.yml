@@ -2,12 +2,9 @@ name: Rcvo – Déploiement en toute sécurité (projet racine)
 
 on:
   push:
-    branches: [ principal ]
-    paths:
-      - "**/*.js"
-      - "**/package.json"
-      - ".github/workflows/deploy-full-safe.yml"
+    branches: [ main, principal ]
   workflow_dispatch:
+
 
 permissions:
   id-token: write
