@@ -1,0 +1,49 @@
+name: Deploy PROD via OIDC
+
+on:
+  workflow_dispatch: # Lancement manuel
+  push:
+    branches:
+      - main # ou 'principal' si tu veux aussi sur cette branche
+
+permissions:
+  id-token: write   # OIDC token
+  contents: read    # lecture du code
+
+env:
+  AWS_REGION: eu-west-3
+  EB_APP_NAME: rcvo-backend
+  EB_ENV_NAME: Rcvo-Backend-prod
+  S3_BUCKET: rcvo-officiel
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # 1) Récupère le code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2) Configure AWS via OIDC
+      - name: Configure AWS credentials from OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::409818814260:role/RcvoGithubDeployRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 3) Installe EB CLI
+      - name: Install Elastic Beanstalk CLI
+        run: |
+          pip install awsebcli --upgrade
+
+      # 4) Prépare le package de déploiement
+      - name: Create deployment package
+        run: |
+          zip -r deploy-package.zip . -x "*.git*" "*.github*" "node_modules/*" ".env"
+
+      # 5) Envoie la version sur EB
+      - name: Deploy to Elastic Beanstalk PROD
+        run: |
+          eb init "$EB_APP_NAME" --region "$AWS_REGION"
+          eb use "$EB_ENV_NAME"
+          eb deploy "$EB_ENV_NAME" --staged --timeout 30
