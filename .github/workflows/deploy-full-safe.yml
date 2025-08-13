@@ -2,120 +2,146 @@ name: Rcvo – Déploiement en toute sécurité (projet racine)
 
 on:
   push:
-    branches:
-      - main
-      - principal
+    branches: [ main, principal ]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
 
 env:
   AWS_REGION: eu-west-3
   APP_NAME: rcvo-backend
   STAGING_ENV: Rcvo-Backend-staging
   PROD_ENV: Rcvo-Backend-prod
-  BASE_SCHEME: http  # HTTPS sera activé plus tard après config SSL
-
-permissions:
-  id-token: write
-  contents: read
+  BUCKET: rcvo-officiel
+  BASE_SCHEME: http            # passera à https après SSL
+  HEALTH_PATH: /health
+  SYNC_HEALTH: /health
+  VERIFY_HEALTH: /health
+  LABEL: build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.run_number }}
 
 jobs:
   build:
-    name: construire
+    name: build
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Installer Node.js
+      - name: Setup Node 22
         uses: actions/setup-node@v4
         with:
           node-version: '22'
 
-      - name: Installer dépendances (ci si lockfile, sinon install)
-  run: |
-    if [ -f package-lock.json ]; then
-      npm ci
-    else
-      echo "⚠️ package-lock.json absent → npm install"
-      npm install
-    fi
+      - name: Install dependencies (ci if lockfile, else install)
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "⚠ package-lock.json missing → npm install"
+            npm install
+          fi
 
-
-      - name: Construire projet
+      - name: Optional build
         run: npm run build --if-present
 
+      - name: Pack app (exclude node_modules and .git)
+        run: zip -r app.zip . -x "node_modules/*" ".git/*"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload to S3
+        run: aws s3 cp app.zip "s3://${{ env.BUCKET }}/${{ env.APP_NAME }}/${{ env.LABEL }}.zip"
+
   deploy-staging:
-    name: déploiement-staging
+    name: deploy-staging
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Auth AWS (OIDC)
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::409818814260:role/RcvoGithubDeployRole
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Attendre que STAGING soit prêt (pré-update)
+      - name: Wait until STAGING is ready (pre-update)
         run: |
-          for i in {1..30}; do
-            STATUS=$(aws elasticbeanstalk describe-environments \
-              --environment-names "${{ env.STAGING_ENV }}" \
-              --query 'Environments[0].Status' --output text)
-            if [ "$STATUS" = "Ready" ]; then
-              echo "✅ STAGING prêt"
-              exit 0
-            fi
-            echo "⏳ Attente que STAGING soit prêt…"
+          for i in {1..120}; do
+            OUT=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" \
+              --query "Environments[0].[Status,AbortableOperationInProgress]" --output text)
+            STATUS=$(echo "$OUT" | awk '{print $1}')
+            ABRT=$(echo "$OUT" | awk '{print $2}')
+            echo "Status=$STATUS Abortable=$ABRT"
+            [ "$STATUS" = "Ready" ] && [ "$ABRT" = "false" ] && break
             sleep 10
           done
-          echo "❌ STAGING pas prêt après 5 min"
-          exit 1
 
-      - name: Créer version EB (idempotent)
+      - name: Create EB application version (idempotent)
         run: |
-          ZIP="build-$(date +%s).zip"
-          aws s3 cp "$ZIP" "s3://rcvo-officiel/$ZIP" || echo "Pas de ZIP, build local ignoré"
           aws elasticbeanstalk create-application-version \
             --application-name "${{ env.APP_NAME }}" \
-            --version-label "$ZIP" \
-            --source-bundle S3Bucket="rcvo-officiel",S3Key="$ZIP" \
-            || echo "⚠️ Version déjà existante"
+            --version-label "${{ env.LABEL }}" \
+            --source-bundle S3Bucket="${{ env.BUCKET }}",S3Key="${{ env.APP_NAME }}/${{ env.LABEL }}.zip" || true
 
-      - name: Pousser variables d'env (STAGING)
+      - name: Update STAGING (env vars + version, with retry)
         run: |
-          aws elasticbeanstalk update-environment \
-            --environment-name "${{ env.STAGING_ENV }}" \
-            --option-settings Namespace=aws:elasticbeanstalk:application:environment,OptionName=PORT,Value=8080
-
-      - name: Déployer version sur STAGING
-        run: |
-          aws elasticbeanstalk update-environment \
-            --environment-name "${{ env.STAGING_ENV }}" \
-            --version-label "$(aws elasticbeanstalk describe-environments \
-              --environment-names "${{ env.STAGING_ENV }}" \
-              --query 'Environments[0].VersionLabel' --output text)"
-
-      - name: Attendre GREEN (STAGE)
-        run: |
+          # retry update until accepted
           for i in {1..30}; do
-            HEALTH=$(aws elasticbeanstalk describe-environments \
-              --environment-names "${{ env.STAGING_ENV }}" \
-              --query 'Environments[0].Health' --output text)
-            if [ "$HEALTH" = "Green" ]; then
-              echo "✅ Santé GREEN"
-              exit 0
-            fi
-            echo "⏳ Attente santé GREEN…"
+            set +e
+            aws elasticbeanstalk update-environment \
+              --environment-name "${{ env.STAGING_ENV }}" \
+              --version-label "${{ env.LABEL }}" \
+              --option-settings \
+                Namespace=aws:elasticbeanstalk:application:environment,OptionName=PORT,Value=8080 \
+                Namespace=aws:elasticbeanstalk:application:environment,OptionName=ALLOWED_ORIGIN,Value="*" \
+                Namespace=aws:elasticbeanstalk:application:environment,OptionName=JWT_SECRET,Value="${{ secrets.RCVO_JWT_SECRET }}" \
+                Namespace=aws:elasticbeanstalk:application:environment,OptionName=ADMIN_EMAIL,Value="${{ secrets.RCVO_ADMIN_EMAIL }}" \
+                Namespace=aws:elasticbeanstalk:application:environment,OptionName=ADMIN_PASSWORD,Value="${{ secrets.RCVO_ADMIN_PASSWORD }}"
+            CODE=$?
+            set -e
+            [ $CODE -eq 0 ] && echo "Update accepted." && break
+            echo "Not ready yet, retry in 10s ($i/30)…"
             sleep 10
           done
-          exit 1
 
-      - name: Essais de fumée (STAGING)
+          # wait end of update (back to Ready)
+          for i in {1..120}; do
+            OUT=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" \
+              --query "Environments[0].[Status,Health,AbortableOperationInProgress]" --output text)
+            STATUS=$(echo "$OUT" | awk '{print $1}')
+            HEALTH=$(echo "$OUT" | awk '{print $2}')
+            ABRT=$(echo "$OUT" | awk '{print $3}')
+            echo "Post: Status=$STATUS Health=$HEALTH Abortable=$ABRT"
+            [ "$STATUS" = "Ready" ] && [ "$ABRT" = "false" ] && break
+            sleep 15
+          done
+
+      - name: Wait GREEN (STAGING)
         run: |
-          URL="${{ env.BASE_SCHEME }}://$(aws elasticbeanstalk describe-environments \
-            --environment-names "${{ env.STAGING_ENV }}" \
-            --query 'Environments[0].CNAME' --output text)"
-          echo "Test sur $URL/health"
-          curl -I "$URL/health" || exit 1
+          for i in {1..80}; do
+            H=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" --query "Environments[0].Health" --output text)
+            S=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" --query "Environments[0].Status" --output text)
+            echo "Health=$H Status=$S"
+            [ "$H" = "Green" ] && [ "$S" = "Ready" ] && exit 0
+            sleep 15
+          done
+          echo "STAGING not Green/Ready in time"; exit 1
+
+      - name: Smoke tests (STAGING)
+        run: |
+          URL="${{ env.BASE_SCHEME }}://$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" --query "Environments[0].CNAME" --output text)"
+          for p in "${{ env.HEALTH_PATH }}" "${{ env.SYNC_HEALTH }}" "${{ env.VERIFY_HEALTH }}"; do
+            ok=0
+            for i in {1..15}; do
+              code=$(curl -sk -o /dev/null -w "%{http_code}" "${URL}${p}")
+              echo "${p} -> ${code}"
+              [ "$code" = "200" ] && ok=1 && break
+              sleep 3
+            done
+            [ $ok -eq 1 ] || { echo "Smoke failed on ${p}"; exit 1; }
+          done
