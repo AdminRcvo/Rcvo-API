@@ -17,10 +17,11 @@ env:
   PROD_ENV: Rcvo-Backend-prod
   BUCKET: rcvo-officiel
   HEALTH_PATH: /health
-  SYNC_HEALTH: /api/sync/health
-  VERIFY_HEALTH: /api/verify/health
+  SYNC_HEALTH: /health
+  VERIFY_HEALTH: /health
   ALLOWED_ORIGIN: https://www.rcvo-crm-auto.com
   LABEL: build-${{ github.sha }}
+
 
 jobs:
   build:
