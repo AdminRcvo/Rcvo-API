@@ -15,15 +15,14 @@ permissions:
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
-  APP_NAME: rcvo-backend               # <- ton application EB en minuscules
+  APP_NAME: rcvo-backend
   STAGING_ENV: Rcvo-Backend-staging
   PROD_ENV: Rcvo-Backend-prod
   BUCKET: rcvo-officiel
   HEALTH_PATH: /health
-  SYNC_HEALTH: /health                 # pour éviter 404 tant que l’API n’est pas câblée
+  SYNC_HEALTH: /health
   VERIFY_HEALTH: /health
   ALLOWED_ORIGIN: https://www.rcvo-crm-auto.com
-  # Label 100% unique (sha + run_id + tentative + timestamp)
   LABEL: build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.run_number }}
 
 jobs:
@@ -62,47 +61,73 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # --- NEW: attendre que l'env ne soit plus en création/màj avant d'agir
       - name: Attendre que STAGING soit prêt (pré-update)
         run: |
-          for i in {1..80}; do
-            STATUS=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" --query "Environments[0].Status" --output text)
-            HEALTH=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" --query "Environments[0].Health" --output text)
-            echo "Status=$STATUS Health=$HEALTH"
-            # On veut au moins que l'env soit 'Ready' (peu importe la couleur pour l'instant)
-            [ "$STATUS" = "Ready" ] && break
+          for i in {1..120}; do
+            OUT=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" \
+              --query "Environments[0].[Status,Health,HealthStatus,AbortableOperationInProgress]" --output text)
+            STATUS=$(echo "$OUT" | awk '{print $1}')
+            HEALTH=$(echo "$OUT" | awk '{print $2}')
+            HSTAT=$(echo "$OUT" | awk '{print $3}')
+            ABRT=$(echo "$OUT" | awk '{print $4}')
+            echo "Status=$STATUS Health=$HEALTH HealthStatus=$HSTAT Abortable=$ABRT"
+            [ "$STATUS" = "Ready" ] && [ "$ABRT" = "false" ] && break
             sleep 15
           done
 
-      # --- create-application-version idempotent (ignore AlreadyExists)
       - name: Créer version EB (idempotent)
         run: |
-          set -e
-          set -o pipefail
           aws elasticbeanstalk create-application-version \
             --application-name "${{ env.APP_NAME }}" \
             --version-label "${{ env.LABEL }}" \
-            --source-bundle S3Bucket="${{ env.BUCKET }}",S3Key="${{ env.APP_NAME }}/${{ env.LABEL }}.zip" \
-          || {
-            code=$?
-            echo "create-application-version a renvoyé $code (probablement AlreadyExists). On continue."
-          }
+            --source-bundle S3Bucket="${{ env.BUCKET }}",S3Key="${{ env.APP_NAME }}/${{ env.LABEL }}.zip" || true
 
-      - name: Pousser variables d'env (STAGING)
+      # ⬇️ Étape fusionnée : variables d'env + version + retries + attente fin d'update
+      - name: Mettre à jour STAGING (vars + version, avec retry)
         run: |
-          aws elasticbeanstalk update-environment \
-            --environment-name "${{ env.STAGING_ENV }}" \
-            --option-settings \
-              Namespace=aws:elasticbeanstalk:application:environment,OptionName=ALLOWED_ORIGIN,Value="${{ env.ALLOWED_ORIGIN }}" \
-              Namespace=aws:elasticbeanstalk:application:environment,OptionName=JWT_SECRET,Value="${{ secrets.RCVO_JWT_SECRET }}" \
-              Namespace=aws:elasticbeanstalk:application:environment,OptionName=ADMIN_EMAIL,Value="${{ secrets.RCVO_ADMIN_EMAIL }}" \
-              Namespace=aws:elasticbeanstalk:application:environment,OptionName=ADMIN_PASSWORD,Value="${{ secrets.RCVO_ADMIN_PASSWORD }}"
+          # 1) Re-check: attendre Ready sans opération en cours
+          for i in {1..120}; do
+            OUT=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" \
+              --query "Environments[0].[Status,AbortableOperationInProgress]" --output text)
+            STATUS=$(echo "$OUT" | awk '{print $1}')
+            ABRT=$(echo "$OUT" | awk '{print $2}')
+            echo "Pre-check -> Status=$STATUS Abortable=$ABRT"
+            [ "$STATUS" = "Ready" ] && [ "$ABRT" = "false" ] && break
+            sleep 10
+          done
 
-      - name: Déployer version sur STAGING
-        run: |
-          aws elasticbeanstalk update-environment \
-            --environment-name "${{ env.STAGING_ENV }}" \
-            --version-label "${{ env.LABEL }}"
+          # 2) Lancer update (vars + version) avec retries si refus "Doit être prêt"
+          for i in {1..30}; do
+            set +e
+            aws elasticbeanstalk update-environment \
+              --environment-name "${{ env.STAGING_ENV }}" \
+              --version-label "${{ env.LABEL }}" \
+              --option-settings \
+                Namespace=aws:elasticbeanstalk:application:environment,OptionName=ALLOWED_ORIGIN,Value="${{ env.ALLOWED_ORIGIN }}" \
+                Namespace=aws:elasticbeanstalk:application:environment,OptionName=JWT_SECRET,Value="${{ secrets.RCVO_JWT_SECRET }}" \
+                Namespace=aws:elasticbeanstalk:application:environment,OptionName=ADMIN_EMAIL,Value="${{ secrets.RCVO_ADMIN_EMAIL }}" \
+                Namespace=aws:elasticbeanstalk:application:environment,OptionName=ADMIN_PASSWORD,Value="${{ secrets.RCVO_ADMIN_PASSWORD }}"
+            CODE=$?
+            set -e
+            if [ $CODE -eq 0 ]; then
+              echo "Update lancé."
+              break
+            fi
+            echo "Env non prêt, retry dans 10s… (tentative $i/30)"
+            sleep 10
+          done
+
+          # 3) Attendre retour à Ready (fin d'update)
+          for i in {1..120}; do
+            OUT=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" \
+              --query "Environments[0].[Status,Health,AbortableOperationInProgress]" --output text)
+            STATUS=$(echo "$OUT" | awk '{print $1}')
+            HEALTH=$(echo "$OUT" | awk '{print $2}')
+            ABRT=$(echo "$OUT" | awk '{print $3}')
+            echo "Post-check -> Status=$STATUS Health=$HEALTH Abortable=$ABRT"
+            [ "$STATUS" = "Ready" ] && [ "$ABRT" = "false" ] && break
+            sleep 15
+          done
 
       - name: Attendre GREEN (STAGING)
         run: |
@@ -115,7 +140,7 @@ jobs:
           done
           echo "STAGING pas Green/Ready à temps"; exit 1
 
-      - name: Smoke tests (STAGING)
+      - name: Essais de fumée (STAGING)
         run: |
           URL="https://$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" --query "Environments[0].CNAME" --output text)"
           for p in "${{ env.HEALTH_PATH }}" "${{ env.SYNC_HEALTH }}" "${{ env.VERIFY_HEALTH }}"; do
@@ -146,14 +171,15 @@ jobs:
             --query "Environments[0].VersionLabel" --output text)
           echo "prev=${PREV}" >> $GITHUB_OUTPUT
 
-      # Attendre que PROD soit Ready avant de pousser
       - name: Attendre que PROD soit prêt (pré-update)
         run: |
-          for i in {1..80}; do
-            STATUS=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.PROD_ENV }}" --query "Environments[0].Status" --output text)
-            HEALTH=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.PROD_ENV }}" --query "Environments[0].Health" --output text)
-            echo "Status=$STATUS Health=$HEALTH"
-            [ "$STATUS" = "Ready" ] && break
+          for i in {1..120}; do
+            OUT=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.PROD_ENV }}" \
+              --query "Environments[0].[Status,AbortableOperationInProgress]" --output text)
+            STATUS=$(echo "$OUT" | awk '{print $1}')
+            ABRT=$(echo "$OUT" | awk '{print $2}')
+            echo "Status=$STATUS Abortable=$ABRT"
+            [ "$STATUS" = "Ready" ] && [ "$ABRT" = "false" ] && break
             sleep 15
           done
 
