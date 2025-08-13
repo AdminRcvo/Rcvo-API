@@ -3,8 +3,11 @@ name: Rcvo – Déploiement en toute sécurité (projet racine)
 on:
   push:
     branches: [ main, principal ]
+    paths:
+      - "**/*.js"
+      - "**/package.json"
+      - ".github/workflows/deploy-full-safe.yml"
   workflow_dispatch:
-
 
 permissions:
   id-token: write
@@ -12,16 +15,16 @@ permissions:
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
-  APP_NAME: rcvo-backend
+  APP_NAME: rcvo-backend               # <- ton application EB en minuscules
   STAGING_ENV: Rcvo-Backend-staging
   PROD_ENV: Rcvo-Backend-prod
   BUCKET: rcvo-officiel
   HEALTH_PATH: /health
-  SYNC_HEALTH: /health
+  SYNC_HEALTH: /health                 # pour éviter 404 tant que l’API n’est pas câblée
   VERIFY_HEALTH: /health
   ALLOWED_ORIGIN: https://www.rcvo-crm-auto.com
-  LABEL: build-${{ github.sha }}
-
+  # Label 100% unique (sha + run_id + tentative + timestamp)
+  LABEL: build-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.run_number }}
 
 jobs:
   build:
@@ -34,7 +37,6 @@ jobs:
         uses: actions/setup-node@v4
         with: { node-version: '22' }
 
-      # Si pas de package-lock.json, npm ci échoue -> on bascule sur npm i
       - name: Install deps
         run: npm ci || npm i
 
@@ -60,13 +62,34 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Créer version EB + variables d'env (STAGING)
+      # --- NEW: attendre que l'env ne soit plus en création/màj avant d'agir
+      - name: Attendre que STAGING soit prêt (pré-update)
         run: |
+          for i in {1..80}; do
+            STATUS=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" --query "Environments[0].Status" --output text)
+            HEALTH=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" --query "Environments[0].Health" --output text)
+            echo "Status=$STATUS Health=$HEALTH"
+            # On veut au moins que l'env soit 'Ready' (peu importe la couleur pour l'instant)
+            [ "$STATUS" = "Ready" ] && break
+            sleep 15
+          done
+
+      # --- create-application-version idempotent (ignore AlreadyExists)
+      - name: Créer version EB (idempotent)
+        run: |
+          set -e
+          set -o pipefail
           aws elasticbeanstalk create-application-version \
             --application-name "${{ env.APP_NAME }}" \
             --version-label "${{ env.LABEL }}" \
-            --source-bundle S3Bucket="${{ env.BUCKET }}",S3Key="${{ env.APP_NAME }}/${{ env.LABEL }}.zip" || true
+            --source-bundle S3Bucket="${{ env.BUCKET }}",S3Key="${{ env.APP_NAME }}/${{ env.LABEL }}.zip" \
+          || {
+            code=$?
+            echo "create-application-version a renvoyé $code (probablement AlreadyExists). On continue."
+          }
 
+      - name: Pousser variables d'env (STAGING)
+        run: |
           aws elasticbeanstalk update-environment \
             --environment-name "${{ env.STAGING_ENV }}" \
             --option-settings \
@@ -75,27 +98,29 @@ jobs:
               Namespace=aws:elasticbeanstalk:application:environment,OptionName=ADMIN_EMAIL,Value="${{ secrets.RCVO_ADMIN_EMAIL }}" \
               Namespace=aws:elasticbeanstalk:application:environment,OptionName=ADMIN_PASSWORD,Value="${{ secrets.RCVO_ADMIN_PASSWORD }}"
 
+      - name: Déployer version sur STAGING
+        run: |
           aws elasticbeanstalk update-environment \
             --environment-name "${{ env.STAGING_ENV }}" \
             --version-label "${{ env.LABEL }}"
 
       - name: Attendre GREEN (STAGING)
         run: |
-          for i in {1..40}; do
+          for i in {1..80}; do
             H=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" --query "Environments[0].Health" --output text)
             S=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" --query "Environments[0].Status" --output text)
             echo "Health=$H Status=$S"
             [ "$H" = "Green" ] && [ "$S" = "Ready" ] && exit 0
             sleep 15
           done
-          exit 1
+          echo "STAGING pas Green/Ready à temps"; exit 1
 
       - name: Smoke tests (STAGING)
         run: |
           URL="https://$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" --query "Environments[0].CNAME" --output text)"
           for p in "${{ env.HEALTH_PATH }}" "${{ env.SYNC_HEALTH }}" "${{ env.VERIFY_HEALTH }}"; do
             ok=0
-            for i in {1..10}; do
+            for i in {1..15}; do
               code=$(curl -sk -o /dev/null -w "%{http_code}" "${URL}${p}")
               echo "${p} -> ${code}"
               [ "$code" = "200" ] && ok=1 && break
@@ -117,8 +142,20 @@ jobs:
       - name: Mémoriser version actuelle PROD
         id: prev
         run: |
-          PREV=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.PROD_ENV }}" --query "Environments[0].VersionLabel" --output text)
+          PREV=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.PROD_ENV }}" \
+            --query "Environments[0].VersionLabel" --output text)
           echo "prev=${PREV}" >> $GITHUB_OUTPUT
+
+      # Attendre que PROD soit Ready avant de pousser
+      - name: Attendre que PROD soit prêt (pré-update)
+        run: |
+          for i in {1..80}; do
+            STATUS=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.PROD_ENV }}" --query "Environments[0].Status" --output text)
+            HEALTH=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.PROD_ENV }}" --query "Environments[0].Health" --output text)
+            echo "Status=$STATUS Health=$HEALTH"
+            [ "$STATUS" = "Ready" ] && break
+            sleep 15
+          done
 
       - name: Déployer en PROD
         run: aws elasticbeanstalk update-environment --environment-name "${{ env.PROD_ENV }}" --version-label "${{ env.LABEL }}"
@@ -127,7 +164,7 @@ jobs:
         id: waitgreen
         continue-on-error: true
         run: |
-          for i in {1..40}; do
+          for i in {1..80}; do
             H=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.PROD_ENV }}" --query "Environments[0].Health" --output text)
             S=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.PROD_ENV }}" --query "Environments[0].Status" --output text)
             echo "Health=$H Status=$S"
@@ -143,7 +180,7 @@ jobs:
           URL="https://$(aws elasticbeanstalk describe-environments --environment-names "${{ env.PROD_ENV }}" --query "Environments[0].CNAME" --output text)"
           for p in "${{ env.HEALTH_PATH }}" "${{ env.SYNC_HEALTH }}" "${{ env.VERIFY_HEALTH }}"; do
             ok=0
-            for i in {1..10}; do
+            for i in {1..15}; do
               code=$(curl -sk -o /dev/null -w "%{http_code}" "${URL}${p}")
               echo "${p} -> ${code}"
               [ "$code" = "200" ] && ok=1 && break
