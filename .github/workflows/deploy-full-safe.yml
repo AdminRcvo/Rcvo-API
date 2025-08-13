@@ -1,8 +1,8 @@
-name: Rcvo – Full Safe Deploy (root project)
+name: Rcvo – Déploiement en toute sécurité (projet racine)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ principal ]
     paths:
       - "**/*.js"
       - "**/package.json"
@@ -29,18 +29,26 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
         with: { node-version: '22' }
-      # Si tu n'as pas de package-lock.json, npm ci échouera → fallback sur npm i
-      - run: npm ci || npm i
-      - name: Pack (exclut node_modules et .git)
+
+      # Si pas de package-lock.json, npm ci échoue -> on bascule sur npm i
+      - name: Install deps
+        run: npm ci || npm i
+
+      - name: Pack (sans node_modules et .git)
         run: zip -r app.zip . -x "node_modules/*" ".git/*"
+
       - name: Auth AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
+
       - name: Upload vers S3
         run: aws s3 cp app.zip "s3://${{ env.BUCKET }}/${{ env.APP_NAME }}/${{ env.LABEL }}.zip"
 
@@ -53,12 +61,14 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
-      - name: Version EB + variables d'env (STAGING)
+
+      - name: Créer version EB + variables d'env (STAGING)
         run: |
           aws elasticbeanstalk create-application-version \
             --application-name "${{ env.APP_NAME }}" \
             --version-label "${{ env.LABEL }}" \
             --source-bundle S3Bucket="${{ env.BUCKET }}",S3Key="${{ env.APP_NAME }}/${{ env.LABEL }}.zip" || true
+
           aws elasticbeanstalk update-environment \
             --environment-name "${{ env.STAGING_ENV }}" \
             --option-settings \
@@ -66,9 +76,11 @@ jobs:
               Namespace=aws:elasticbeanstalk:application:environment,OptionName=JWT_SECRET,Value="${{ secrets.RCVO_JWT_SECRET }}" \
               Namespace=aws:elasticbeanstalk:application:environment,OptionName=ADMIN_EMAIL,Value="${{ secrets.RCVO_ADMIN_EMAIL }}" \
               Namespace=aws:elasticbeanstalk:application:environment,OptionName=ADMIN_PASSWORD,Value="${{ secrets.RCVO_ADMIN_PASSWORD }}"
+
           aws elasticbeanstalk update-environment \
             --environment-name "${{ env.STAGING_ENV }}" \
             --version-label "${{ env.LABEL }}"
+
       - name: Attendre GREEN (STAGING)
         run: |
           for i in {1..40}; do
@@ -79,6 +91,7 @@ jobs:
             sleep 15
           done
           exit 1
+
       - name: Smoke tests (STAGING)
         run: |
           URL="https://$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" --query "Environments[0].CNAME" --output text)"
@@ -102,13 +115,16 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
+
       - name: Mémoriser version actuelle PROD
         id: prev
         run: |
           PREV=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.PROD_ENV }}" --query "Environments[0].VersionLabel" --output text)
           echo "prev=${PREV}" >> $GITHUB_OUTPUT
+
       - name: Déployer en PROD
         run: aws elasticbeanstalk update-environment --environment-name "${{ env.PROD_ENV }}" --version-label "${{ env.LABEL }}"
+
       - name: Attendre GREEN (PROD)
         id: waitgreen
         continue-on-error: true
@@ -121,7 +137,8 @@ jobs:
             sleep 15
           done
           exit 1
-      - name: Checks (PROD)
+
+      - name: Post-checks (PROD)
         id: prodchecks
         continue-on-error: true
         run: |
@@ -136,6 +153,7 @@ jobs:
             done
             [ $ok -eq 1 ] || { echo "PROD check failed on ${p}"; exit 1; }
           done
+
       - name: Auto-rollback si échec
         if: steps.waitgreen.outcome == 'failure' || steps.prodchecks.outcome == 'failure'
         run: |
