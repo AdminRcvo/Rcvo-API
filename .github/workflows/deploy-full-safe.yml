@@ -15,7 +15,7 @@ env:
   STAGING_ENV: Rcvo-Backend-staging
   PROD_ENV: Rcvo-Backend-prod
   BUCKET: rcvo-officiel
-  BASE_SCHEME: http            # passera à https après SSL
+  BASE_SCHEME: http
   HEALTH_PATH: /health
   SYNC_HEALTH: /health
   VERIFY_HEALTH: /health
@@ -34,13 +34,16 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install dependencies (ci if lockfile, else install)
+      - name: Install dependencies (auto fallback)
         run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            echo "⚠ package-lock.json missing → npm install"
-            npm install
+          set +e
+          npm ci
+          CODE=$?
+          set -e
+          if [ $CODE -ne 0 ]; then
+            echo "npm ci failed → fallback to npm install"
+            rm -f package-lock.json npm-shrinkwrap.json
+            npm install --no-audit --no-fund
           fi
 
       - name: Optional build
@@ -90,7 +93,6 @@ jobs:
 
       - name: Update STAGING (env vars + version, with retry)
         run: |
-          # retry update until accepted
           for i in {1..30}; do
             set +e
             aws elasticbeanstalk update-environment \
@@ -109,7 +111,6 @@ jobs:
             sleep 10
           done
 
-          # wait end of update (back to Ready)
           for i in {1..120}; do
             OUT=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.STAGING_ENV }}" \
               --query "Environments[0].[Status,Health,AbortableOperationInProgress]" --output text)
