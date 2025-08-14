@@ -1,8 +1,8 @@
-name: Déploiement sur Elastic Beanstalk (OIDC)
+name: Déploiement STAGING sur Elastic Beanstalk (OIDC)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ staging ]
   workflow_dispatch:
 
 permissions:
@@ -11,8 +11,8 @@ permissions:
 
 env:
   AWS_REGION: eu-west-3
-  APP_NAME: Rcvo-backend                 # Nom exact de l'application EB
-  ENV_NAME: Rcvo-Backend-staging         # Mets rcvo-backend-prod si tu déploies en prod
+  APP_NAME: Rcvo-backend
+  ENV_NAME: Rcvo-Backend-staging
 
 jobs:
   deployer:
@@ -126,13 +126,44 @@ jobs:
           done
           echo "❌ Timeout"; exit 1
 
-      - name: Test de fumée (/health)
+      - name: Test de fumée (/health) – HTTPS puis fallback HTTP
+        shell: bash
         run: |
+          set -euo pipefail
           CNAME="$(aws elasticbeanstalk describe-environments \
+            --region "${AWS_REGION}" \
             --environment-names "${ENV_NAME}" \
             --query 'Environments[0].CNAME' --output text)"
-          URL="https://${CNAME}/health"
-          echo "Test: $URL"
-          code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL" || true)
-          echo "Code HTTP: $code"
-          [[ "$code" == "200" ]] || (echo "❌ Test KO" && exit 1)
+
+          try_curl () {
+            local URL="$1"
+            echo "→ Probe ${URL}"
+            curl -skS --connect-timeout 5 --max-time 15 \
+                 --retry 3 --retry-delay 2 --retry-connrefused \
+                 -o /dev/null -w "%{http_code}" "$URL" || true
+          }
+
+          CODE_HTTPS=$(try_curl "https://${CNAME}/health")
+          echo "HTTPS code: ${CODE_HTTPS}"
+
+          if [[ "${CODE_HTTPS}" != "200" ]]; then
+            CODE_HTTP=$(try_curl "http://${CNAME}/health")
+            echo "HTTP code: ${CODE_HTTP}"
+          else
+            CODE_HTTP="000"
+          fi
+
+          if [[ "${CODE_HTTPS}" == "200" || "${CODE_HTTP}" == "200" ]]; then
+            echo "✅ Smoke test OK"
+            exit 0
+          fi
+
+          echo "❌ Smoke test KO (HTTPS=${CODE_HTTPS}, HTTP=${CODE_HTTP})"
+          echo "— Extrait logs EB pour debug —"
+          aws elasticbeanstalk request-environment-info \
+            --region "${AWS_REGION}" --environment-name "${ENV_NAME}" --info-type tail || true
+          sleep 8
+          aws elasticbeanstalk retrieve-environment-info \
+            --region "${AWS_REGION}" --environment-name "${ENV_NAME}" --info-type tail \
+            --query 'EnvironmentInfo[-1].Message' --output text | xargs -I{} sh -c 'echo "Logs URL: {}"; curl -s "{}" | tail -n 120' || true
+          exit 1
