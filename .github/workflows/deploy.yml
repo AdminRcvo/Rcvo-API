@@ -6,20 +6,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write
+  id-token: write     # requis pour OIDC
   contents: read
-
-- name: Auth AWS (OIDC)
-  uses: aws-actions/configure-aws-credentials@v4
-  with:
-    aws-region: eu-west-3
-    role-to-assume: arn:aws:iam::409818814260:role/GithubOIDCRcvoDeploy
-
 
 env:
   AWS_REGION: eu-west-3
-  APP_NAME: Rcvo-backend                 # <-- nom exact de l'application EB
-  ENV_NAME: Rcvo-Backend-staging        # <-- mets rcvo-backend-prod si tu déploies PROD
+  APP_NAME: Rcvo-backend              # nom exact de l'application EB
+  ENV_NAME: Rcvo-Backend-staging      # mets rcvo-backend-prod pour PROD
 
 jobs:
   deployer:
@@ -66,7 +59,6 @@ jobs:
           SHA="${GITHUB_SHA::7}"
           ZIP="app-${SHA}-${TS}.zip"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
-          # On n’envoie pas .git ni node_modules
           zip -r "$ZIP" . -x ".git/*" "node_modules/*"
 
       - name: Déterminer le bucket EB (CreateStorageLocation idempotent)
@@ -78,8 +70,7 @@ jobs:
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
 
       - name: Upload vers S3
-        run: |
-          aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
+        run: aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
 
       - name: Créer/Enregistrer la version d’appli (idempotent)
         id: appver
@@ -129,7 +120,6 @@ jobs:
           CNAME="$(aws elasticbeanstalk describe-environments \
             --environment-names "${ENV_NAME}" \
             --query 'Environments[0].CNAME' --output text)"
-          # Pour STAGING on tente HTTP; si PROD déjà en HTTPS, on reteste en HTTPS si 4xx/5xx
           URL="http://${CNAME}/health"
           echo "Smoke test: $URL"
           code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
