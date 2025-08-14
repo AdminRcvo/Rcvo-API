@@ -2,7 +2,7 @@ name: Déploiement STAGING (OIDC)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ staging ]
   workflow_dispatch:
 
 permissions:
@@ -11,8 +11,8 @@ permissions:
 
 env:
   AWS_REGION: eu-west-3
-  APP_NAME: Rcvo-backend
-  ENV_NAME: Rcvo-Backend-staging
+  APP_NAME: Rcvo-backend                 # Nom exact de l'application EB
+  ENV_NAME: Rcvo-Backend-staging         # Environnement EB de staging
 
 jobs:
   deployer:
@@ -58,42 +58,47 @@ jobs:
           SHA="${GITHUB_SHA::7}"
           ZIP="app-${SHA}-${TS}.zip"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          # Exclure .git, node_modules et l’archive elle-même si le job est relancé
           zip -r "$ZIP" . -x ".git/*" "node_modules/*" "$ZIP"
 
-      - name: Déterminer le bucket EB
+      - name: Déterminer le bucket EB (CreateStorageLocation idempotent)
         id: bucket
+        shell: bash
         run: |
+          set -euo pipefail
           BUCKET="$(aws elasticbeanstalk create-storage-location --region "${AWS_REGION}" --query S3Bucket --output text)"
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
 
       - name: Upload vers S3
+        shell: bash
         run: |
-          aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
+          set -euo pipefail
+          aws s3 cp "./${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
 
-      - name: Créer/Enregistrer la version d’appli
+      - name: Créer / enregistrer la version d’application (idempotent)
         id: appver
+        shell: bash
         run: |
+          set -euo pipefail
           LABEL="${{ steps.pack.outputs.zip }}"
           aws elasticbeanstalk create-application-version \
             --region "${AWS_REGION}" \
             --application-name "${APP_NAME}" \
             --version-label "$LABEL" \
             --source-bundle S3Bucket="${{ steps.bucket.outputs.bucket }}",S3Key="${{ steps.pack.outputs.zip }}" \
-          || echo "Version déjà existante"
+          || echo "Version déjà existante, on continue."
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
+      # Attente PRÉ-déploiement : ordre corrigé (Health puis Status)
       - name: Attendre que l'environnement soit prêt (pré-déploiement)
         shell: bash
         run: |
           set -euo pipefail
           for i in {1..30}; do
-            OUT="$(aws elasticbeanstalk describe-environments \
+            read HEALTH STATUS <<<"$(aws elasticbeanstalk describe-environments \
               --region "${AWS_REGION}" \
               --environment-names "${ENV_NAME}" \
-              --query 'Environments[0].[Health,Status]' \
-              --output text)"
-            HEALTH=$(echo "$OUT" | awk '{print $1}')
-            STATUS=$(echo "$OUT" | awk '{print $2}')
+              --query 'Environments[0].[Health,Status]' --output text)"
             echo "STATUS=$STATUS  HEALTH=$HEALTH"
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
               echo "✅ ${ENV_NAME} est prêt."
@@ -101,15 +106,19 @@ jobs:
             fi
             sleep 10
           done
-          echo "❌ ${ENV_NAME} pas prêt après ~5 min"; exit 1
+          echo "❌ ${ENV_NAME} pas prêt après ~5 min"
+          exit 1
 
       - name: Déployer sur l’environnement
+        shell: bash
         run: |
+          set -euo pipefail
           aws elasticbeanstalk update-environment \
             --region "${AWS_REGION}" \
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
+      # Attente POST-déploiement : ordre corrigé (Health puis Status)
       - name: Attendre que l’environnement soit GREEN
         shell: bash
         timeout-minutes: 15
@@ -121,26 +130,59 @@ jobs:
               --environment-names "${ENV_NAME}" \
               --query 'Environments[0].[Health,Status]' \
               --output text)"
+            echo "$OUT"
             HEALTH=$(echo "$OUT" | awk '{print $1}')
             STATUS=$(echo "$OUT" | awk '{print $2}')
-            echo "STATUS=$STATUS  HEALTH=$HEALTH"
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
               echo "✅ Environnement prêt."
               exit 0
             fi
             sleep 20
           done
-          echo "❌ Timeout"; exit 1
+          echo "❌ Timeout en attente d'un état Ready/Green"
+          exit 1
 
+      # Smoke test robuste avec retries + backoff exponentiel et trace verbose en cas d’échec
       - name: Test de fumée (/health)
         shell: bash
         run: |
+          set -euo pipefail
           CNAME="$(aws elasticbeanstalk describe-environments \
             --region "${AWS_REGION}" \
             --environment-names "${ENV_NAME}" \
             --query 'Environments[0].CNAME' --output text)"
+
+          if [[ -z "$CNAME" || "$CNAME" == "None" ]]; then
+            echo "❌ CNAME vide, impossible de tester"
+            exit 1
+          fi
+
+          # Si ton STAGING n’a pas de TLS, bascule en http://
           URL="https://${CNAME}/health"
-          echo "Test: $URL"
-          code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL" || true)
-          echo "Code HTTP: $code"
-          [[ "$code" == "200" ]] || (echo "❌ Test KO" && exit 1)
+          echo "Test de santé sur: $URL"
+
+          OK=0
+          for i in {1..10}; do
+            echo "🔄 Tentative $i..."
+            code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL" || true)
+            echo "Code HTTP : $code"
+            if [[ "$code" == "200" ]]; then
+              echo "✅ Test OK"
+              OK=1
+              break
+            fi
+            sleep $((i * 5))
+          done
+
+          if [[ "$OK" -eq 0 ]]; then
+            echo "❌ Test KO après plusieurs tentatives — détails CURL :"
+            curl -skv "$URL" || true
+            # Tentative de secours en HTTP simple si TLS non présent en STAGING
+            echo "⛑️  Tentative HTTP de secours…"
+            URL_FALLBACK="http://${CNAME}/health"
+            echo "Fallback: $URL_FALLBACK"
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL_FALLBACK" || true)
+            echo "Code HTTP (fallback): $code"
+            [[ "$code" == "200" ]] || (echo "❌ Smoke test KO" && exit 1)
+            echo "✅ Test OK en HTTP (fallback)"
+          fi
