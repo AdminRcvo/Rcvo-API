@@ -2,7 +2,7 @@ name: Déploiement STAGING (OIDC)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ staging ]
   workflow_dispatch:
 
 permissions:
@@ -53,7 +53,23 @@ jobs:
       - name: Build (if present)
         run: npm run build --if-present
 
-      - name: Package app
+      # === ATTENDRE que l'env soit READY avant d'ordonner le déploiement ===
+      - name: Attendre que l'environnement soit READY
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..40}; do
+            STATUS=$(aws elasticbeanstalk describe-environments \
+              --environment-names "${ENV_NAME}" \
+              --query 'Environments[0].Status' --output text)
+            echo "Statut actuel : $STATUS"
+            [ "$STATUS" = "Ready" ] && exit 0
+            sleep 15
+          done
+          echo "❌ L'environnement n'est pas READY (timeout)"; exit 1
+
+      # === PACKAGING + UPLOAD + VERSION EB ===
+      - name: Packager l'application
         id: pack
         shell: bash
         run: |
@@ -64,7 +80,7 @@ jobs:
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
           zip -r "$ZIP" . -x ".git/*" "node_modules/*"
 
-      - name: Ensure EB S3 bucket
+      - name: Récupérer le bucket S3 Elastic Beanstalk
         id: bucket
         shell: bash
         run: |
@@ -72,10 +88,10 @@ jobs:
           BUCKET="$(aws elasticbeanstalk create-storage-location --query S3Bucket --output text)"
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
 
-      - name: Upload to S3
+      - name: Upload artefact vers S3
         run: aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
 
-      - name: Create app version (idempotent)
+      - name: Créer la version d’application (idempotent)
         id: appver
         shell: bash
         run: |
@@ -85,16 +101,18 @@ jobs:
             --application-name "${APP_NAME}" \
             --version-label "$LABEL" \
             --source-bundle S3Bucket="${{ steps.bucket.outputs.bucket }}",S3Key="${{ steps.pack.outputs.zip }}" \
-          || echo "Version already exists, continue."
+          || echo "Version déjà existante, on continue."
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
-      - name: Update environment (STAGING)
+      # === DEPLOY ===
+      - name: Déployer sur Elastic Beanstalk (STAGING)
         run: |
           aws elasticbeanstalk update-environment \
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
-      - name: Wait GREEN
+      # === WAIT GREEN ===
+      - name: Attendre que l’environnement soit GREEN
         shell: bash
         timeout-minutes: 15
         run: |
@@ -108,15 +126,15 @@ jobs:
             STATUS=$(echo "$OUT" | awk '{print $1}')
             HEALTH=$(echo "$OUT" | awk '{print $2}')
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
-              echo "✅ Environment is GREEN."
+              echo "✅ Environnement GREEN."
               exit 0
             fi
             sleep 20
           done
-          echo "❌ Timeout waiting for GREEN"
-          exit 1
+          echo "❌ Timeout en attente de GREEN"; exit 1
 
-      - name: Smoke test /health (HTTP then HTTPS)
+      # === SMOKE TEST ===
+      - name: Smoke test /health (HTTP puis HTTPS)
         shell: bash
         run: |
           set -euo pipefail
@@ -130,4 +148,4 @@ jobs:
             code=$(curl -sk -o /dev/null -w "%{http_code}" "https://$CNAME/health" || true)
             echo "HTTPS /health => $code"
           fi
-          [[ "$code" == "200" ]] || (echo "❌ Smoke test failed" && exit 1)
+          [[ "$code" == "200" ]] || (echo "❌ Smoke test KO" && exit 1)
