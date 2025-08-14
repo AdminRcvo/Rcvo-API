@@ -1,8 +1,8 @@
-name: Déploiement STAGING sur Elastic Beanstalk (OIDC)
+name: Déploiement STAGING (OIDC)
 
 on:
   push:
-    branches: [ staging ]
+    branches: [ main ]  # change si tu veux déclencher sur une autre branche
   workflow_dispatch:
 
 permissions:
@@ -11,8 +11,8 @@ permissions:
 
 env:
   AWS_REGION: eu-west-3
-  APP_NAME: Rcvo-backend
-  ENV_NAME: Rcvo-Backend-staging
+  APP_NAME: Rcvo-backend            # Nom exact de l'application EB
+  ENV_NAME: Rcvo-Backend-staging    # Environnement EB cible (staging)
 
 jobs:
   deployer:
@@ -58,13 +58,27 @@ jobs:
           SHA="${GITHUB_SHA::7}"
           ZIP="app-${SHA}-${TS}.zip"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
-          zip -r "$ZIP" . -x ".git/*" "node_modules/*"
+          # ⚠️ exclure l’archive elle-même + .git + node_modules
+          zip -r "$ZIP" . -x ".git/*" "node_modules/*" "$ZIP"
 
-      - name: Déterminer le bucket EB (CreateStorageLocation idempotent)
+      - name: Déterminer le bucket EB (avec fallback)
         id: bucket
+        shell: bash
         run: |
-          BUCKET="$(aws elasticbeanstalk create-storage-location --query S3Bucket --output text)"
-          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          if BUCKET=$(aws elasticbeanstalk create-storage-location --region "${AWS_REGION}" --query S3Bucket --output text 2>/dev/null); then
+            echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          else
+            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+            CANDIDATE="elasticbeanstalk-${AWS_REGION}-${ACCOUNT_ID}"
+            # Vérifie qu'il existe
+            if aws s3api head-bucket --bucket "$CANDIDATE" 2>/dev/null; then
+              echo "bucket=$CANDIDATE" >> "$GITHUB_OUTPUT"
+            else
+              echo "❌ Impossible d'obtenir le bucket EB" >&2
+              exit 1
+            fi
+          fi
 
       - name: Upload vers S3
         run: |
@@ -72,9 +86,12 @@ jobs:
 
       - name: Créer/Enregistrer la version d’appli
         id: appver
+        shell: bash
         run: |
+          set -euo pipefail
           LABEL="${{ steps.pack.outputs.zip }}"
           aws elasticbeanstalk create-application-version \
+            --region "${AWS_REGION}" \
             --application-name "${APP_NAME}" \
             --version-label "$LABEL" \
             --source-bundle S3Bucket="${{ steps.bucket.outputs.bucket }}",S3Key="${{ steps.pack.outputs.zip }}" \
@@ -86,10 +103,11 @@ jobs:
         run: |
           set -euo pipefail
           for i in {1..30}; do
-            read STATUS HEALTH <<<"$(aws elasticbeanstalk describe-environments \
+            # On lit Health puis Status (renvoie 'Green  Ready')
+            read HEALTH STATUS <<<"$(aws elasticbeanstalk describe-environments \
               --region "${AWS_REGION}" \
               --environment-names "${ENV_NAME}" \
-              --query 'Environments[0].[Status,Health]' --output text)"
+              --query 'Environments[0].[Health,Status]' --output text)"
             echo "STATUS=$STATUS  HEALTH=$HEALTH"
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
               echo "✅ ${ENV_NAME} est prêt."
@@ -102,6 +120,7 @@ jobs:
       - name: Déployer sur l’environnement
         run: |
           aws elasticbeanstalk update-environment \
+            --region "${AWS_REGION}" \
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
@@ -112,6 +131,7 @@ jobs:
           set -euo pipefail
           for i in {1..45}; do
             OUT="$(aws elasticbeanstalk describe-environments \
+              --region "${AWS_REGION}" \
               --environment-names "${ENV_NAME}" \
               --query 'Environments[0].[Health,Status]' \
               --output text)"
@@ -126,7 +146,7 @@ jobs:
           done
           echo "❌ Timeout"; exit 1
 
-      - name: Test de fumée (/health) – HTTPS puis fallback HTTP
+      - name: Test de fumée (/health)
         shell: bash
         run: |
           set -euo pipefail
@@ -134,36 +154,15 @@ jobs:
             --region "${AWS_REGION}" \
             --environment-names "${ENV_NAME}" \
             --query 'Environments[0].CNAME' --output text)"
-
-          try_curl () {
-            local URL="$1"
-            echo "→ Probe ${URL}"
-            curl -skS --connect-timeout 5 --max-time 15 \
-                 --retry 3 --retry-delay 2 --retry-connrefused \
-                 -o /dev/null -w "%{http_code}" "$URL" || true
-          }
-
-          CODE_HTTPS=$(try_curl "https://${CNAME}/health")
-          echo "HTTPS code: ${CODE_HTTPS}"
-
-          if [[ "${CODE_HTTPS}" != "200" ]]; then
-            CODE_HTTP=$(try_curl "http://${CNAME}/health")
-            echo "HTTP code: ${CODE_HTTP}"
-          else
-            CODE_HTTP="000"
+          # STAGING répond en HTTP (LB termine TLS éventuellement en prod) → on tente HTTP puis HTTPS
+          URL_HTTP="http://${CNAME}/health"
+          URL_HTTPS="https://${CNAME}/health"
+          echo "Test HTTP:  $URL_HTTP"
+          code=$(curl -s -o /dev/null -w "%{http_code}" "$URL_HTTP" || true)
+          echo "Code HTTP: $code"
+          if [[ "$code" != "200" ]]; then
+            echo "HTTP pas OK, on tente HTTPS…"
+            code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL_HTTPS" || true)
+            echo "Code HTTPS: $code"
           fi
-
-          if [[ "${CODE_HTTPS}" == "200" || "${CODE_HTTP}" == "200" ]]; then
-            echo "✅ Smoke test OK"
-            exit 0
-          fi
-
-          echo "❌ Smoke test KO (HTTPS=${CODE_HTTPS}, HTTP=${CODE_HTTP})"
-          echo "— Extrait logs EB pour debug —"
-          aws elasticbeanstalk request-environment-info \
-            --region "${AWS_REGION}" --environment-name "${ENV_NAME}" --info-type tail || true
-          sleep 8
-          aws elasticbeanstalk retrieve-environment-info \
-            --region "${AWS_REGION}" --environment-name "${ENV_NAME}" --info-type tail \
-            --query 'EnvironmentInfo[-1].Message' --output text | xargs -I{} sh -c 'echo "Logs URL: {}"; curl -s "{}" | tail -n 120' || true
-          exit 1
+          [[ "$code" == "200" ]] || (echo "❌ Smoke test KO" && exit 1)
