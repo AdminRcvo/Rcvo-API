@@ -1,26 +1,133 @@
-name: Deploy STAGING (Elastic Beanstalk via OIDC)
+name: Déploiement STAGING (OIDC)
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
+  workflow_dispatch:
 
 permissions:
-  id-token: write      # Nécessaire pour OIDC
+  id-token: write
   contents: read
+
+env:
+  AWS_REGION: eu-west-3
+  APP_NAME: Rcvo-backend
+  ENV_NAME: Rcvo-Backend-staging
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    concurrency:
+      group: staging-deploy
+      cancel-in-progress: true
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials from OIDC
-        uses: aws-actions/configure-aws-credentials@v3
+      - name: Auth AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::<AWS_ACCOUNT_ID>:role/<ROLE_NAME>
-          aws-region: eu-west-3
+          role-to-assume: arn:aws:iam::409818814260:role/GithubOIDCRcvoDeploy
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-staging
 
-      # Tes étapes de déploiement ici…
+      - name: Who am I (STS)
+        run: aws sts get-caller-identity
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Build (if present)
+        run: npm run build --if-present
+
+      - name: Package app
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          TS="$(date +%Y%m%d_%H%M%S)"
+          SHA="${GITHUB_SHA::7}"
+          ZIP="app-${SHA}-${TS}.zip"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          zip -r "$ZIP" . -x ".git/*" "node_modules/*"
+
+      - name: Ensure EB S3 bucket
+        id: bucket
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUCKET="$(aws elasticbeanstalk create-storage-location --query S3Bucket --output text)"
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to S3
+        run: aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
+
+      - name: Create app version (idempotent)
+        id: appver
+        shell: bash
+        run: |
+          set -euo pipefail
+          LABEL="${{ steps.pack.outputs.zip }}"
+          aws elasticbeanstalk create-application-version \
+            --application-name "${APP_NAME}" \
+            --version-label "$LABEL" \
+            --source-bundle S3Bucket="${{ steps.bucket.outputs.bucket }}",S3Key="${{ steps.pack.outputs.zip }}" \
+          || echo "Version already exists, continue."
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+
+      - name: Update environment (STAGING)
+        run: |
+          aws elasticbeanstalk update-environment \
+            --environment-name "${ENV_NAME}" \
+            --version-label "${{ steps.appver.outputs.label }}"
+
+      - name: Wait GREEN
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          for i in {1..45}; do
+            OUT="$(aws elasticbeanstalk describe-environments \
+              --environment-names "${ENV_NAME}" \
+              --query 'Environments[0].{Status:Status,Health:Health,HealthStatus:HealthStatus,Version:VersionLabel}' \
+              --output text || true)"
+            echo "$OUT"
+            STATUS=$(echo "$OUT" | awk '{print $1}')
+            HEALTH=$(echo "$OUT" | awk '{print $2}')
+            if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
+              echo "✅ Environment is GREEN."
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "❌ Timeout waiting for GREEN"
+          exit 1
+
+      - name: Smoke test /health (HTTP then HTTPS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CNAME="$(aws elasticbeanstalk describe-environments \
+            --environment-names "${ENV_NAME}" \
+            --query 'Environments[0].CNAME' --output text)"
+          echo "CNAME=$CNAME"
+          code=$(curl -s -o /dev/null -w "%{http_code}" "http://$CNAME/health" || true)
+          echo "HTTP /health => $code"
+          if [[ "$code" != "200" ]]; then
+            code=$(curl -sk -o /dev/null -w "%{http_code}" "https://$CNAME/health" || true)
+            echo "HTTPS /health => $code"
+          fi
+          [[ "$code" == "200" ]] || (echo "❌ Smoke test failed" && exit 1)
