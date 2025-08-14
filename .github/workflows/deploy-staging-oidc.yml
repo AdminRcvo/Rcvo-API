@@ -1,8 +1,8 @@
-name: Déploiement sur Elastic Beanstalk (OIDC)
+name: Déploiement STAGING (OIDC)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ staging ]
   workflow_dispatch:
 
 permissions:
@@ -29,7 +29,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Vérifier l’identité AWS
-        run: aws sts get-caller-identity
+        run: aws sts get-caller-identity --region "${AWS_REGION}"
 
       - name: Installer Node.js
         uses: actions/setup-node@v4
@@ -37,6 +37,7 @@ jobs:
           node-version: '22'
 
       - name: Installer dépendances (lockfile si présent)
+        shell: bash
         run: |
           set -euo pipefail
           if [ -f package-lock.json ]; then
@@ -48,38 +49,49 @@ jobs:
       - name: Build (facultatif)
         run: npm run build --if-present
 
+      # Création de l’archive à déployer (en excluant elle-même et dossiers lourds)
       - name: Créer l’archive à déployer
         id: pack
+        shell: bash
         run: |
           set -euo pipefail
           TS="$(date +%Y%m%d_%H%M%S)"
           SHA="${GITHUB_SHA::7}"
           ZIP="app-${SHA}-${TS}.zip"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
-          zip -r "$ZIP" . -x ".git/*" "node_modules/*"
+          # Exclure l'archive elle-même, .git et node_modules
+          zip -r "$ZIP" . -x ".git/*" "node_modules/*" "$ZIP"
 
-      - name: Déterminer le bucket EB
+      - name: Déterminer le bucket EB (CreateStorageLocation idempotent)
         id: bucket
+        shell: bash
         run: |
-          BUCKET="$(aws elasticbeanstalk create-storage-location --query S3Bucket --output text)"
+          set -euo pipefail
+          BUCKET="$(aws elasticbeanstalk create-storage-location --region "${AWS_REGION}" --query S3Bucket --output text)"
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
 
       - name: Upload vers S3
+        shell: bash
         run: |
-          aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
+          set -euo pipefail
+          aws s3 cp "./${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}" --region "${AWS_REGION}"
 
-      - name: Créer/Enregistrer la version d’appli
+      - name: Créer/Enregistrer la version d’appli (idempotent)
         id: appver
+        shell: bash
         run: |
+          set -euo pipefail
           LABEL="${{ steps.pack.outputs.zip }}"
           aws elasticbeanstalk create-application-version \
+            --region "${AWS_REGION}" \
             --application-name "${APP_NAME}" \
             --version-label "$LABEL" \
             --source-bundle S3Bucket="${{ steps.bucket.outputs.bucket }}",S3Key="${{ steps.pack.outputs.zip }}" \
-          || echo "Version déjà existante"
+          || echo "Version déjà existante, on continue."
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
       - name: Attendre que l'environnement soit prêt (pré-déploiement)
+        shell: bash
         run: |
           set -euo pipefail
           for i in {1..30}; do
@@ -97,20 +109,24 @@ jobs:
           echo "❌ ${ENV_NAME} pas prêt après ~5 min"; exit 1
 
       - name: Déployer sur l’environnement
+        shell: bash
         run: |
+          set -euo pipefail
           aws elasticbeanstalk update-environment \
+            --region "${AWS_REGION}" \
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
       - name: Attendre que l’environnement soit GREEN
+        shell: bash
         timeout-minutes: 15
         run: |
           set -euo pipefail
           for i in {1..45}; do
             OUT="$(aws elasticbeanstalk describe-environments \
+              --region "${AWS_REGION}" \
               --environment-names "${ENV_NAME}" \
-              --query 'Environments[0].[Health,Status]' \
-              --output text)"
+              --query 'Environments[0].[Health,Status]' --output text)"
             echo "$OUT"
             HEALTH=$(echo "$OUT" | awk '{print $1}')
             STATUS=$(echo "$OUT" | awk '{print $2}')
@@ -120,11 +136,14 @@ jobs:
             fi
             sleep 20
           done
-          echo "❌ Timeout"; exit 1
+          echo "❌ Timeout en attente de GREEN"; exit 1
 
-      - name: Test de fumée (/health)
+      - name: Test de fumée (/health) en HTTPS
+        shell: bash
         run: |
+          set -euo pipefail
           CNAME="$(aws elasticbeanstalk describe-environments \
+            --region "${AWS_REGION}" \
             --environment-names "${ENV_NAME}" \
             --query 'Environments[0].CNAME' --output text)"
           URL="https://${CNAME}/health"
