@@ -6,13 +6,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write     # requis pour OIDC
+  id-token: write
   contents: read
 
 env:
   AWS_REGION: eu-west-3
-  APP_NAME: Rcvo-backend              # nom exact de l'application EB
-  ENV_NAME: Rcvo-Backend-staging      # mets rcvo-backend-prod pour PROD
+  APP_NAME: Rcvo-backend
+  ENV_NAME: rcvo-backend-prod  # ← mets Rcvo-Backend-staging si tu veux cibler STAGING
 
 jobs:
   deployer:
@@ -25,8 +25,8 @@ jobs:
       - name: Auth AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::409818814260:role/GithubOIDCRcvoDeploy
           aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::409818814260:role/GithubOIDCRcvoDeploy
 
       - name: Vérifier l’identité
         run: aws sts get-caller-identity
@@ -50,7 +50,7 @@ jobs:
       - name: Build (facultatif)
         run: npm run build --if-present
 
-      - name: Créer l’archive à déployer
+      - name: Pack zip à déployer
         id: pack
         shell: bash
         run: |
@@ -61,7 +61,7 @@ jobs:
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
           zip -r "$ZIP" . -x ".git/*" "node_modules/*"
 
-      - name: Déterminer le bucket EB (CreateStorageLocation idempotent)
+      - name: Bucket EB (CreateStorageLocation idempotent)
         id: bucket
         shell: bash
         run: |
@@ -70,9 +70,10 @@ jobs:
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
 
       - name: Upload vers S3
-        run: aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
+        run: |
+          aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
 
-      - name: Créer/Enregistrer la version d’appli (idempotent)
+      - name: Créer / enregistrer la version EB
         id: appver
         shell: bash
         run: |
@@ -91,7 +92,7 @@ jobs:
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
-      - name: Attendre que l’environnement soit GREEN
+      - name: Attendre GREEN
         shell: bash
         timeout-minutes: 15
         run: |
@@ -113,7 +114,7 @@ jobs:
           echo "❌ Timeout en attente de GREEN"
           exit 1
 
-      - name: Test de fumée (/health)
+      - name: Smoke test /health (HTTP puis HTTPS)
         shell: bash
         run: |
           set -euo pipefail
@@ -121,11 +122,10 @@ jobs:
             --environment-names "${ENV_NAME}" \
             --query 'Environments[0].CNAME' --output text)"
           URL="http://${CNAME}/health"
-          echo "Smoke test: $URL"
+          echo "Test: $URL"
           code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
           echo "HTTP code: $code"
           if [[ "$code" != "200" ]]; then
-            echo "HTTP pas OK, on tente HTTPS…"
             code=$(curl -sk -o /dev/null -w "%{http_code}" "https://${CNAME}/health" || true)
             echo "HTTPS code: $code"
           fi
