@@ -6,8 +6,15 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write     # néc. pour OIDC
+  id-token: write
   contents: read
+
+- name: Auth AWS (OIDC)
+  uses: aws-actions/configure-aws-credentials@v4
+  with:
+    aws-region: eu-west-3
+    role-to-assume: arn:aws:iam::409818814260:role/GithubOIDCRcvoDeploy
+
 
 env:
   AWS_REGION: eu-west-3
