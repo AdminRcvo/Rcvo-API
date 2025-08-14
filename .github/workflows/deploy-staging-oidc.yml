@@ -2,7 +2,7 @@ name: Déploiement STAGING (OIDC)
 
 on:
   push:
-    branches: [ main ]  # change si tu veux déclencher sur une autre branche
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -11,8 +11,8 @@ permissions:
 
 env:
   AWS_REGION: eu-west-3
-  APP_NAME: Rcvo-backend            # Nom exact de l'application EB
-  ENV_NAME: Rcvo-Backend-staging    # Environnement EB cible (staging)
+  APP_NAME: Rcvo-backend
+  ENV_NAME: Rcvo-Backend-staging
 
 jobs:
   deployer:
@@ -58,27 +58,13 @@ jobs:
           SHA="${GITHUB_SHA::7}"
           ZIP="app-${SHA}-${TS}.zip"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
-          # ⚠️ exclure l’archive elle-même + .git + node_modules
           zip -r "$ZIP" . -x ".git/*" "node_modules/*" "$ZIP"
 
-      - name: Déterminer le bucket EB (avec fallback)
+      - name: Déterminer le bucket EB
         id: bucket
-        shell: bash
         run: |
-          set -euo pipefail
-          if BUCKET=$(aws elasticbeanstalk create-storage-location --region "${AWS_REGION}" --query S3Bucket --output text 2>/dev/null); then
-            echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
-          else
-            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-            CANDIDATE="elasticbeanstalk-${AWS_REGION}-${ACCOUNT_ID}"
-            # Vérifie qu'il existe
-            if aws s3api head-bucket --bucket "$CANDIDATE" 2>/dev/null; then
-              echo "bucket=$CANDIDATE" >> "$GITHUB_OUTPUT"
-            else
-              echo "❌ Impossible d'obtenir le bucket EB" >&2
-              exit 1
-            fi
-          fi
+          BUCKET="$(aws elasticbeanstalk create-storage-location --region "${AWS_REGION}" --query S3Bucket --output text)"
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
 
       - name: Upload vers S3
         run: |
@@ -86,9 +72,7 @@ jobs:
 
       - name: Créer/Enregistrer la version d’appli
         id: appver
-        shell: bash
         run: |
-          set -euo pipefail
           LABEL="${{ steps.pack.outputs.zip }}"
           aws elasticbeanstalk create-application-version \
             --region "${AWS_REGION}" \
@@ -103,11 +87,13 @@ jobs:
         run: |
           set -euo pipefail
           for i in {1..30}; do
-            # On lit Health puis Status (renvoie 'Green  Ready')
-            read HEALTH STATUS <<<"$(aws elasticbeanstalk describe-environments \
+            OUT="$(aws elasticbeanstalk describe-environments \
               --region "${AWS_REGION}" \
               --environment-names "${ENV_NAME}" \
-              --query 'Environments[0].[Health,Status]' --output text)"
+              --query 'Environments[0].[Health,Status]' \
+              --output text)"
+            HEALTH=$(echo "$OUT" | awk '{print $1}')
+            STATUS=$(echo "$OUT" | awk '{print $2}')
             echo "STATUS=$STATUS  HEALTH=$HEALTH"
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
               echo "✅ ${ENV_NAME} est prêt."
@@ -135,13 +121,13 @@ jobs:
               --environment-names "${ENV_NAME}" \
               --query 'Environments[0].[Health,Status]' \
               --output text)"
-            echo "$OUT"
             HEALTH=$(echo "$OUT" | awk '{print $1}')
-STATUS=$(echo "$OUT" | awk '{print $2}')
-if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
-  echo "✅ $ENV_NAME est prêt."
-  exit 0
-fi
+            STATUS=$(echo "$OUT" | awk '{print $2}')
+            echo "STATUS=$STATUS  HEALTH=$HEALTH"
+            if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
+              echo "✅ Environnement prêt."
+              exit 0
+            fi
             sleep 20
           done
           echo "❌ Timeout"; exit 1
@@ -149,20 +135,12 @@ fi
       - name: Test de fumée (/health)
         shell: bash
         run: |
-          set -euo pipefail
           CNAME="$(aws elasticbeanstalk describe-environments \
             --region "${AWS_REGION}" \
             --environment-names "${ENV_NAME}" \
             --query 'Environments[0].CNAME' --output text)"
-          # STAGING répond en HTTP (LB termine TLS éventuellement en prod) → on tente HTTP puis HTTPS
-          URL_HTTP="http://${CNAME}/health"
-          URL_HTTPS="https://${CNAME}/health"
-          echo "Test HTTP:  $URL_HTTP"
-          code=$(curl -s -o /dev/null -w "%{http_code}" "$URL_HTTP" || true)
+          URL="https://${CNAME}/health"
+          echo "Test: $URL"
+          code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL" || true)
           echo "Code HTTP: $code"
-          if [[ "$code" != "200" ]]; then
-            echo "HTTP pas OK, on tente HTTPS…"
-            code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL_HTTPS" || true)
-            echo "Code HTTPS: $code"
-          fi
-          [[ "$code" == "200" ]] || (echo "❌ Smoke test KO" && exit 1)
+          [[ "$code" == "200" ]] || (echo "❌ Test KO" && exit 1)
