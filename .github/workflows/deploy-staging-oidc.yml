@@ -137,11 +137,11 @@ jobs:
               --output text)"
             echo "$OUT"
             HEALTH=$(echo "$OUT" | awk '{print $1}')
-            STATUS=$(echo "$OUT" | awk '{print $2}')
-            if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
-              echo "✅ Environnement prêt."
-              exit 0
-            fi
+STATUS=$(echo "$OUT" | awk '{print $2}')
+if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
+  echo "✅ $ENV_NAME est prêt."
+  exit 0
+fi
             sleep 20
           done
           echo "❌ Timeout"; exit 1
