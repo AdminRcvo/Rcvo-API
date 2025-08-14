@@ -6,14 +6,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write
+  id-token: write     # OIDC
   contents: read
 
 env:
   AWS_REGION: eu-west-3
   APP_NAME: Rcvo-backend
   ENV_NAME: Rcvo-Backend-staging
-  ROLE_ARN: arn:aws:iam::409818814260:role/GithubOIDCRcvoDeploy
 
 jobs:
   deployer:
@@ -23,18 +22,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: (Diag) Contexte GitHub
-        run: |
-          echo "EVENT=$GITHUB_EVENT_NAME"
-          echo "REF=$GITHUB_REF"
-          echo "REPO=$GITHUB_REPOSITORY"
-
       - name: Auth AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: arn:aws:iam::409818814260:role/GithubOIDCRcvoDeploy
           aws-region: ${{ env.AWS_REGION }}
-          role-session-name: rcvo-stg
 
       - name: Vérifier l’identité AWS
         run: aws sts get-caller-identity
@@ -45,15 +37,23 @@ jobs:
           node-version: '22'
 
       - name: Installer dépendances
+        shell: bash
         run: |
-          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
 
       - name: Build (facultatif)
         run: npm run build --if-present
 
       - name: Pack ZIP
         id: pack
+        shell: bash
         run: |
+          set -euo pipefail
           TS="$(date +%Y%m%d_%H%M%S)"
           SHA="${GITHUB_SHA::7}"
           ZIP="app-${SHA}-${TS}.zip"
@@ -62,16 +62,20 @@ jobs:
 
       - name: Bucket EB (idempotent)
         id: bucket
+        shell: bash
         run: |
+          set -euo pipefail
           BUCKET="$(aws elasticbeanstalk create-storage-location --query S3Bucket --output text)"
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
 
       - name: Upload vers S3
         run: aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
 
-      - name: Créer/Enregistrer la version d’appli
+      - name: Créer / enregistrer la version d’appli (idempotent)
         id: appver
+        shell: bash
         run: |
+          set -euo pipefail
           LABEL="${{ steps.pack.outputs.zip }}"
           aws elasticbeanstalk create-application-version \
             --application-name "${APP_NAME}" \
@@ -80,36 +84,41 @@ jobs:
           || echo "Version déjà existante."
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
-      - name: Déployer sur l’environnement
+      - name: Mettre à jour l’environnement
         run: |
           aws elasticbeanstalk update-environment \
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
       - name: Attendre READY/GREEN
+        shell: bash
         timeout-minutes: 15
         run: |
+          set -euo pipefail
           for i in {1..45}; do
             OUT="$(aws elasticbeanstalk describe-environments \
               --environment-names "${ENV_NAME}" \
               --query 'Environments[0].{Status:Status,Health:Health}' \
               --output text)"
             echo "$OUT"
-            STATUS=$(echo "$OUT" | awk '{print $1}')
-            HEALTH=$(echo "$OUT" | awk '{print $2}')
-            if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then exit 0; fi
+            STATUS=$(awk '{print $1}' <<<"$OUT")
+            HEALTH=$(awk '{print $2}' <<<"$OUT")
+            if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
+              exit 0
+            fi
             sleep 20
           done
-          echo "Timeout en attente de GREEN"; exit 1
+          echo "Timeout en attente de READY/GREEN"; exit 1
 
-      - name: Test de fumée (/health)
+      - name: Test de fumée /health (HTTP)
+        shell: bash
         run: |
+          set -euo pipefail
           CNAME="$(aws elasticbeanstalk describe-environments \
             --environment-names "${ENV_NAME}" \
             --query 'Environments[0].CNAME' --output text)"
-          for URL in "http://${CNAME}/health" "https://${CNAME}/health"; do
-            code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL" || true)
-            echo "$URL => $code"
-            if [[ "$code" == "200" ]]; then exit 0; fi
-          done
-          echo "Smoke test KO"; exit 1
+          URL="http://${CNAME}/health"
+          echo "Smoke test: $URL"
+          code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
+          echo "HTTP code: $code"
+          [[ "$code" == "200" ]] || (echo "Smoke test KO" && exit 1)
