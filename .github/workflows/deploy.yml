@@ -1,46 +1,135 @@
-name: Deploy to Elastic Beanstalk
+name: Déploiement sur Elastic Beanstalk (OIDC)
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
+  workflow_dispatch:
 
 permissions:
-  id-token: write
+  id-token: write     # néc. pour OIDC
   contents: read
 
+env:
+  AWS_REGION: eu-west-3
+  APP_NAME: Rcvo-backend                 # <-- nom exact de l'application EB
+  ENV_NAME: Rcvo-Backend-staging        # <-- mets rcvo-backend-prod si tu déploies PROD
+
 jobs:
-  deploy:
+  deployer:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Auth AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::409818814260:role/GithubOIDCRcvoDeploy
-          aws-region: eu-west-3
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Install AWS CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y awscli zip
+      - name: Vérifier l’identité
+        run: aws sts get-caller-identity
 
-      - name: Zip application
-        run: |
-          zip -r app.zip . -x "*.git*"
+      - name: Installer Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
-      - name: Deploy to Elastic Beanstalk
+      - name: Installer dépendances (lockfile si présent)
+        shell: bash
         run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "⚠️ package-lock.json absent → npm install"
+            npm install
+          fi
+
+      - name: Build (facultatif)
+        run: npm run build --if-present
+
+      - name: Créer l’archive à déployer
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          TS="$(date +%Y%m%d_%H%M%S)"
+          SHA="${GITHUB_SHA::7}"
+          ZIP="app-${SHA}-${TS}.zip"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          # On n’envoie pas .git ni node_modules
+          zip -r "$ZIP" . -x ".git/*" "node_modules/*"
+
+      - name: Déterminer le bucket EB (CreateStorageLocation idempotent)
+        id: bucket
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUCKET="$(aws elasticbeanstalk create-storage-location --query S3Bucket --output text)"
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+
+      - name: Upload vers S3
+        run: |
+          aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
+
+      - name: Créer/Enregistrer la version d’appli (idempotent)
+        id: appver
+        shell: bash
+        run: |
+          set -euo pipefail
+          LABEL="${{ steps.pack.outputs.zip }}"
           aws elasticbeanstalk create-application-version \
-            --application-name Rcvo-backend \
-            --version-label "build-${GITHUB_SHA}" \
-            --source-bundle S3Bucket="rcvo-officiel",S3Key="build-${GITHUB_SHA}.zip"
+            --application-name "${APP_NAME}" \
+            --version-label "$LABEL" \
+            --source-bundle S3Bucket="${{ steps.bucket.outputs.bucket }}",S3Key="${{ steps.pack.outputs.zip }}" \
+          || echo "Version déjà existante, on continue."
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
-          aws s3 cp app.zip s3://rcvo-officiel/build-${GITHUB_SHA}.zip
-
+      - name: Déployer sur l’environnement
+        run: |
           aws elasticbeanstalk update-environment \
-            --environment-name rcvo-backend-prod \
-            --version-label "build-${GITHUB_SHA}"
+            --environment-name "${ENV_NAME}" \
+            --version-label "${{ steps.appver.outputs.label }}"
+
+      - name: Attendre que l’environnement soit GREEN
+        shell: bash
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          for i in {1..45}; do
+            OUT="$(aws elasticbeanstalk describe-environments \
+              --environment-names "${ENV_NAME}" \
+              --query 'Environments[0].{Status:Status,Health:Health,HealthStatus:HealthStatus,Version:VersionLabel}' \
+              --output text)"
+            echo "$OUT"
+            STATUS=$(echo "$OUT" | awk '{print $1}')
+            HEALTH=$(echo "$OUT" | awk '{print $2}')
+            if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
+              echo "✅ Environnement prêt."
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "❌ Timeout en attente de GREEN"
+          exit 1
+
+      - name: Test de fumée (/health)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CNAME="$(aws elasticbeanstalk describe-environments \
+            --environment-names "${ENV_NAME}" \
+            --query 'Environments[0].CNAME' --output text)"
+          # Pour STAGING on tente HTTP; si PROD déjà en HTTPS, on reteste en HTTPS si 4xx/5xx
+          URL="http://${CNAME}/health"
+          echo "Smoke test: $URL"
+          code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
+          echo "HTTP code: $code"
+          if [[ "$code" != "200" ]]; then
+            echo "HTTP pas OK, on tente HTTPS…"
+            code=$(curl -sk -o /dev/null -w "%{http_code}" "https://${CNAME}/health" || true)
+            echo "HTTPS code: $code"
+          fi
+          [[ "$code" == "200" ]] || (echo "❌ Smoke test KO" && exit 1)
