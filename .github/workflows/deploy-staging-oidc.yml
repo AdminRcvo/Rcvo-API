@@ -5,7 +5,6 @@ on:
     branches: [ staging ]
   workflow_dispatch:
 
-# Empêche 2 déploiements de s'écraser
 concurrency:
   group: deploy-staging
   cancel-in-progress: true
@@ -47,16 +46,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
       - name: Build (facultatif)
         run: npm run build --if-present
 
-      - name: Pack ZIP (exclusion auto de l’archive)
+      # ── Pack et upload de la version ─────────────────────────────────────────────
+      - name: Pack ZIP
         id: pack
         shell: bash
         run: |
@@ -93,54 +89,39 @@ jobs:
           || echo "Version déjà existante"
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
-      # ===== PRÉ-DÉPLOIEMENT : s'assurer que l'env est prêt =====
+      # ── Avant update : vérifier que l'env est prêt ───────────────────────────────
       - name: Attendre READY/GREEN (pré-déploiement)
         shell: bash
         run: |
           set -euo pipefail
-          for i in {1..60}; do  # ~10 minutes
+          for i in {1..60}; do  # ~10 min
             read -r HEALTH STATUS VERSION <<<"$(aws elasticbeanstalk describe-environments \
               --environment-names "${ENV_NAME}" \
               --query 'Environments[0].[Health,Status,VersionLabel]' --output text)"
             echo "PRE  Health=${HEALTH}  Status=${STATUS}  Version=${VERSION}"
-            if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
-              exit 0
-            fi
+            if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then exit 0; fi
             sleep 10
           done
           echo "❌ ${ENV_NAME} non prêt (pré-déploiement)"; exit 1
 
-      # ===== DÉPLOIEMENT : n'update que si la version diffère =====
-      - name: Déployer sur l’environnement (si nécessaire)
-        id: maybe_update
+      # ── Déploiement : on FORCE l'update ─────────────────────────────────────────
+      - name: Déployer sur l’environnement (forcer update)
         shell: bash
         run: |
           set -euo pipefail
           TARGET="${{ steps.appver.outputs.label }}"
-          CURRENT="$(aws elasticbeanstalk describe-environments \
-            --environment-names "${ENV_NAME}" \
-            --query 'Environments[0].VersionLabel' --output text)"
-          echo "Version courante : ${CURRENT}"
-          echo "Version cible    : ${TARGET}"
-          if [[ "${CURRENT}" == "${TARGET}" ]]; then
-            echo "skip_update=true" >> "$GITHUB_OUTPUT"
-            echo "✅ Version déjà déployée, on n'update pas."
-          else
-            echo "skip_update=false" >> "$GITHUB_OUTPUT"
-            aws elasticbeanstalk update-environment \
-              --environment-name "${ENV_NAME}" \
-              --version-label "${TARGET}"
-            echo "▶️ update-environment lancé."
-          fi
+          echo "▶️ Mise à jour vers ${TARGET}"
+          aws elasticbeanstalk update-environment \
+            --environment-name "${ENV_NAME}" \
+            --version-label "${TARGET}"
 
-      # ===== POST-DÉPLOIEMENT : attendre Version + Ready/Green =====
-      - name: Attendre READY/GREEN (post-déploiement)
-        if: steps.maybe_update.outputs.skip_update == 'false'
+      # ── Après update : on attend la BONNE version + Green/Ready ─────────────────
+      - name: Attendre READY/GREEN + bonne version (post-déploiement)
         shell: bash
         run: |
           set -euo pipefail
           TARGET="${{ steps.appver.outputs.label }}"
-          for i in {1..75}; do  # ~25 minutes
+          for i in {1..75}; do  # ~25 min
             read -r HEALTH STATUS VERSION <<<"$(aws elasticbeanstalk describe-environments \
               --environment-names "${ENV_NAME}" \
               --query 'Environments[0].[Health,Status,VersionLabel]' --output text)"
@@ -151,7 +132,7 @@ jobs:
             fi
             sleep 20
           done
-          echo "❌ Timeout : la version cible n'a pas été appliquée ou l'état n'est pas Green/Ready."
+          echo "❌ Timeout : version cible non appliquée ou état != Green/Ready."
           echo "---- Derniers événements EB ----"
           aws elasticbeanstalk describe-events \
             --environment-name "${ENV_NAME}" \
@@ -159,7 +140,7 @@ jobs:
             --query 'Events[].{Time:EventDate,Message:Message,Severity:Severity}' --output table || true
           exit 1
 
-      # ===== SMOKE TEST =====
+      # ── Smoke test robuste (HTTPS puis fallback HTTP) ───────────────────────────
       - name: Test de fumée (/health)
         shell: bash
         run: |
@@ -171,7 +152,7 @@ jobs:
           URL_HTTP="http://${CNAME}/health"
           echo "Smoke test HTTPS: ${URL_HTTPS}"
           OK=0
-          for i in {1..30}; do  # ~10 minutes total (backoff)
+          for i in {1..30}; do  # ~10 min
             code=$(curl -sk -o /dev/null -w "%{http_code}" "${URL_HTTPS}" || true)
             echo "Tentative $i - HTTPS -> $code"
             if [[ "$code" == "200" ]]; then OK=1; break; fi
@@ -179,7 +160,7 @@ jobs:
           done
           if [[ "$OK" -ne 1 ]]; then
             echo "⚠️ HTTPS pas OK, essai HTTP (fallback)"
-            for i in {1..12}; do  # ~2 minutes
+            for i in {1..12}; do
               code=$(curl -s -o /dev/null -w "%{http_code}" "${URL_HTTP}" || true)
               echo "Tentative $i - HTTP -> $code"
               if [[ "$code" == "200" ]]; then OK=1; break; fi
