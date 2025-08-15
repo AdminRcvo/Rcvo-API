@@ -11,9 +11,8 @@ permissions:
 
 env:
   AWS_REGION: eu-west-3
-  APP_NAME: Rcvo-backend                 # Nom exact de l'application Elastic Beanstalk
-  ENV_NAME: Rcvo-Backend-staging         # Environnement STAGING EB
-  ROLE_ARN: arn:aws:iam::409818814260:role/GithubOIDCRcvoDeploy
+  APP_NAME: Rcvo-backend              # Nom exact de l'application EB
+  ENV_NAME: Rcvo-Backend-staging      # Environnement EB cible
 
 jobs:
   deployer:
@@ -26,7 +25,7 @@ jobs:
       - name: Auth AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.ROLE_ARN }}
+          role-to-assume: arn:aws:iam::409818814260:role/GithubOIDCRcvoDeploy
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Vérifier l’identité AWS
@@ -50,7 +49,7 @@ jobs:
       - name: Build (facultatif)
         run: npm run build --if-present
 
-      - name: Créer l’archive à déployer (exclut elle-même)
+      - name: Créer l’archive à déployer
         id: pack
         shell: bash
         run: |
@@ -72,7 +71,7 @@ jobs:
 
       - name: Upload vers S3
         run: |
-          aws s3 cp "./${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
+          aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
 
       - name: Créer/Enregistrer la version d’appli (idempotent)
         id: appver
@@ -81,14 +80,14 @@ jobs:
           set -euo pipefail
           LABEL="${{ steps.pack.outputs.zip }}"
           aws elasticbeanstalk create-application-version \
+            --region "${AWS_REGION}" \
             --application-name "${APP_NAME}" \
             --version-label "$LABEL" \
             --source-bundle S3Bucket="${{ steps.bucket.outputs.bucket }}",S3Key="${{ steps.pack.outputs.zip }}" \
-          || echo "Version déjà existante (ok)"
+          || echo "Version déjà existante, on continue."
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
-      # ---- Attente PRE-DÉPLOIEMENT : Ready & Green ----
-      - name: Attendre que l’environnement soit prêt avant déploiement
+      - name: Attendre que l’environnement soit prêt (avant déploiement)
         shell: bash
         run: |
           set -euo pipefail
@@ -110,14 +109,14 @@ jobs:
           done
           echo "❌ ${ENV_NAME} pas prêt après ~10 min"; exit 1
 
-      - name: Déployer sur l’environnement (UpdateEnvironment)
+      - name: Déployer sur l’environnement
         run: |
           aws elasticbeanstalk update-environment \
+            --region "${AWS_REGION}" \
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
-      # ---- Attente POST-DÉPLOIEMENT : Ready & Green ----
-      - name: Attendre que l’environnement soit GREEN après déploiement
+      - name: Attendre que l’environnement soit GREEN (post-déploiement)
         shell: bash
         timeout-minutes: 20
         run: |
@@ -140,7 +139,7 @@ jobs:
           done
           echo "❌ Timeout d’attente (environnement non GREEN/Ready)"; exit 1
 
-      - name: Smoke test (/health) avec retries progressifs
+      - name: Test de fumée (/health) avec retries et backoff
         shell: bash
         run: |
           set -euo pipefail
@@ -148,35 +147,21 @@ jobs:
             --region "${AWS_REGION}" \
             --environment-names "${ENV_NAME}" \
             --query 'Environments[0].CNAME' --output text)"
-          if [[ -z "$CNAME" || "$CNAME" == "None" ]]; then
-            echo "❌ CNAME vide"; exit 1
-          fi
+          URL="https://${CNAME}/health"
+          echo "Test: $URL"
 
-          # Essai en HTTPS d’abord (si cert LB) sinon fallback HTTP
-          URL_HTTPS="https://${CNAME}/health"
-          URL_HTTP="http://${CNAME}/health"
-
-          echo "Test HTTPS: $URL_HTTPS"
-          ok=0
-          for i in {1..30}; do
-            code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL_HTTPS" || true)
-            echo "Tentative $i (HTTPS) : $code"
-            if [[ "$code" == "200" ]]; then ok=1; break; fi
-            sleep $((i<10 ? 5 : 10))
+          # 15 tentatives, backoff linéaire
+          for i in {1..15}; do
+            code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL" || true)
+            echo "Tentative $i : HTTP $code"
+            if [[ "$code" == "200" ]]; then
+              echo "✅ Health check OK"
+              exit 0
+            fi
+            sleep $((i * 5))
           done
 
-          if [[ "$ok" -ne 1 ]]; then
-            echo "HTTPS non concluant, tentative HTTP…"
-            for i in {1..20}; do
-              code=$(curl -s -o /dev/null -w "%{http_code}" "$URL_HTTP" || true)
-              echo "Tentative $i (HTTP) : $code"
-              if [[ "$code" == "200" ]]; then ok=1; break; fi
-              sleep 5
-            done
-          fi
-
-          if [[ "$ok" -eq 1 ]]; then
-            echo "✅ Health check OK"
-          else
-            echo "❌ Health check KO"; exit 1
-          fi
+          echo "⚠️ Détails de l’échec (curl -v) :"
+          curl -skv "$URL" || true
+          echo "❌ Health check KO"
+          exit 1
