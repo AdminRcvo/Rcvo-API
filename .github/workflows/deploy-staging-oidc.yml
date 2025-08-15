@@ -1,4 +1,4 @@
-name: Déploiement STAGING (OIDC)
+name: Déploiement STAGING sur Elastic Beanstalk (OIDC)
 
 on:
   push:
@@ -11,8 +11,8 @@ permissions:
 
 env:
   AWS_REGION: eu-west-3
-  APP_NAME: Rcvo-backend              # Nom exact de l'application EB
-  ENV_NAME: Rcvo-Backend-staging      # Environnement EB cible
+  APP_NAME: Rcvo-backend                 # Nom exact de l'application EB
+  ENV_NAME: Rcvo-Backend-staging        # Environnement EB cible (staging)
 
 jobs:
   deployer:
@@ -49,6 +49,7 @@ jobs:
       - name: Build (facultatif)
         run: npm run build --if-present
 
+      # ---------- Packaging & version ----------
       - name: Créer l’archive à déployer
         id: pack
         shell: bash
@@ -61,7 +62,7 @@ jobs:
           # Exclure .git, node_modules et l’archive elle-même
           zip -r "$ZIP" . -x ".git/*" "node_modules/*" "$ZIP"
 
-      - name: Déterminer le bucket EB (idempotent)
+      - name: Déterminer le bucket EB (CreateStorageLocation idempotent)
         id: bucket
         shell: bash
         run: |
@@ -71,7 +72,7 @@ jobs:
 
       - name: Upload vers S3
         run: |
-          aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
+          aws s3 cp "./${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
 
       - name: Créer/Enregistrer la version d’appli (idempotent)
         id: appver
@@ -87,7 +88,8 @@ jobs:
           || echo "Version déjà existante, on continue."
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
-      - name: Attendre que l’environnement soit prêt (avant déploiement)
+      # ---------- Readiness AVANT déploiement ----------
+      - name: Attendre que l’environnement soit prêt (pré-déploiement)
         shell: bash
         run: |
           set -euo pipefail
@@ -97,9 +99,8 @@ jobs:
               --environment-names "${ENV_NAME}" \
               --query 'Environments[0].[Health,Status]' \
               --output text || true)"
-            echo "Sortie: $OUT"
-            HEALTH=$(echo "$OUT" | awk '{print $1}')   # Green
-            STATUS=$(echo "$OUT" | awk '{print $2}')   # Ready
+            echo "Sortie brute: $OUT"
+            read -r HEALTH STATUS <<<"$OUT"
             echo "STATUS=$STATUS  HEALTH=$HEALTH"
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
               echo "✅ ${ENV_NAME} est prêt."
@@ -107,8 +108,10 @@ jobs:
             fi
             sleep 10
           done
-          echo "❌ ${ENV_NAME} pas prêt après ~10 min"; exit 1
+          echo "❌ ${ENV_NAME} pas prêt après ~10 min"
+          exit 1
 
+      # ---------- Déploiement ----------
       - name: Déployer sur l’environnement
         run: |
           aws elasticbeanstalk update-environment \
@@ -116,6 +119,7 @@ jobs:
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
+      # ---------- Readiness APRÈS déploiement ----------
       - name: Attendre que l’environnement soit GREEN (post-déploiement)
         shell: bash
         timeout-minutes: 20
@@ -127,9 +131,8 @@ jobs:
               --environment-names "${ENV_NAME}" \
               --query 'Environments[0].[Health,Status]' \
               --output text || true)"
-            echo "Sortie: $OUT"
-            HEALTH=$(echo "$OUT" | awk '{print $1}')   # Green
-            STATUS=$(echo "$OUT" | awk '{print $2}')   # Ready
+            echo "Sortie brute: $OUT"
+            read -r HEALTH STATUS <<<"$OUT"
             echo "STATUS=$STATUS  HEALTH=$HEALTH"
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
               echo "✅ Environnement prêt."
@@ -137,9 +140,11 @@ jobs:
             fi
             sleep 10
           done
-          echo "❌ Timeout d’attente (environnement non GREEN/Ready)"; exit 1
+          echo "❌ Timeout d’attente (environnement non GREEN/Ready)"
+          exit 1
 
-      - name: Test de fumée (/health) avec retries et backoff
+      # ---------- Smoke test ----------
+      - name: Test de fumée (/health) avec retries et fallback HTTP
         shell: bash
         run: |
           set -euo pipefail
@@ -147,21 +152,32 @@ jobs:
             --region "${AWS_REGION}" \
             --environment-names "${ENV_NAME}" \
             --query 'Environments[0].CNAME' --output text)"
-          URL="https://${CNAME}/health"
-          echo "Test: $URL"
+          echo "CNAME=${CNAME}"
+          URLS=("https://${CNAME}/health" "http://${CNAME}/health")
 
-          # 15 tentatives, backoff linéaire
-          for i in {1..15}; do
-            code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL" || true)
-            echo "Tentative $i : HTTP $code"
-            if [[ "$code" == "200" ]]; then
-              echo "✅ Health check OK"
-              exit 0
-            fi
-            sleep $((i * 5))
+          timeout=$((15*60))   # 15 minutes
+          interval=10
+          elapsed=0
+          ok=0
+
+          while (( elapsed < timeout )); do
+            for URL in "${URLS[@]}"; do
+              echo "Test: $URL"
+              code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL" || true)
+              echo "Code HTTP: $code"
+              if [[ "$code" == "200" ]]; then
+                echo "✅ Health check OK via $URL"
+                ok=1
+                break 2
+              fi
+            done
+            sleep $interval
+            elapsed=$((elapsed + interval))
           done
 
-          echo "⚠️ Détails de l’échec (curl -v) :"
-          curl -skv "$URL" || true
-          echo "❌ Health check KO"
-          exit 1
+          if [[ "$ok" -ne 1 ]]; then
+            echo "❌ Health check KO après $timeout secondes"
+            # Aide au debug : montre les en-têtes de la dernière tentative HTTPS
+            curl -skI "https://${CNAME}/health" || true
+            exit 1
+          fi
