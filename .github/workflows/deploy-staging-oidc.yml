@@ -2,15 +2,16 @@ name: Déploiement STAGING via OIDC (Elastic Beanstalk)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main ]         # adapte si besoin
   workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
 
+# Évite les déploiements concurrents qui se marchent dessus
 concurrency:
-  group: deploy-staging
+  group: eb-staging-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -33,7 +34,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Vérifier l’identité AWS
-        run: aws sts get-caller-identity
+        run: aws sts get-caller-identity --region "${AWS_REGION}"
 
       - name: Installer Node.js
         uses: actions/setup-node@v4
@@ -53,8 +54,7 @@ jobs:
       - name: Build (facultatif)
         run: npm run build --if-present
 
-      # --- Packaging & upload EB ---
-      - name: Créer l’archive à déployer
+      - name: Pack ZIP à déployer
         id: pack
         shell: bash
         run: |
@@ -63,7 +63,7 @@ jobs:
           SHA="${GITHUB_SHA::7}"
           ZIP="app-${SHA}-${TS}.zip"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
-          # Exclure .git, node_modules et l'archive elle-même
+          # Exclure dossier git, node_modules et l’archive elle-même
           zip -r "$ZIP" . -x ".git/*" "node_modules/*" "$ZIP"
 
       - name: Déterminer le bucket EB (CreateStorageLocation idempotent)
@@ -71,144 +71,90 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BUCKET="$(aws elasticbeanstalk create-storage-location --query S3Bucket --output text)"
+          BUCKET="$(aws elasticbeanstalk create-storage-location \
+            --region "${AWS_REGION}" \
+            --query S3Bucket --output text)"
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
 
       - name: Upload vers S3
-        shell: bash
         run: |
-          set -euo pipefail
-          aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
+          aws s3 cp "./${{ steps.pack.outputs.zip }}" \
+            "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}" \
+            --region "${AWS_REGION}"
 
-      - name: Créer/Enregistrer la version d’appli (idempotent)
+      - name: Créer/enregistrer la version d’appli (idempotent)
         id: appver
         shell: bash
         run: |
           set -euo pipefail
           LABEL="${{ steps.pack.outputs.zip }}"
           aws elasticbeanstalk create-application-version \
+            --region "${AWS_REGION}" \
             --application-name "${APP_NAME}" \
             --version-label "$LABEL" \
             --source-bundle S3Bucket="${{ steps.bucket.outputs.bucket }}",S3Key="${{ steps.pack.outputs.zip }}" \
-          || echo "Version déjà existante"
+          || echo "Version déjà existante, on continue."
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
-      # --- ATTENTE AVANT DEPLOIEMENT ---
+      # S'assurer que l'env est bien 'Ready/Green' AVANT update
       - name: Attendre READY/GREEN (pré-déploiement)
         shell: bash
         run: |
           set -euo pipefail
-          LIMIT=$((20*60))  # 20 min max
-          STEP=10
-          ELAPSED=0
-          echo "⏳ Attente que ${ENV_NAME} soit READY/GREEN AVANT update-environment…"
-
-          while :; do
-            STATUS=$(aws elasticbeanstalk describe-environments \
+          END=$((SECONDS + 10*60))
+          echo "⏳ Pré-déploiement : on attend ${ENV_NAME} en Ready/Green…"
+          while (( SECONDS < END )); do
+            read HEALTH STATUS <<<"$(aws elasticbeanstalk describe-environments \
+              --region "${AWS_REGION}" \
               --environment-names "${ENV_NAME}" \
-              --query "Environments[0].Status" --output text)
-            HEALTH=$(aws elasticbeanstalk describe-environments \
-              --environment-names "${ENV_NAME}" \
-              --query "Environments[0].Health" --output text)
-            echo "Etat: $STATUS / Santé: $HEALTH"
-
-            if [ "$STATUS" = "Ready" ] && [ "$HEALTH" = "Green" ]; then
-              echo "✅ Environnement prêt (pré-déploiement)."
-              break
+              --query 'Environments[0].[Health,Status]' --output text)"
+            echo "$(date -u '+%H:%M:%S') HEALTH=${HEALTH} STATUS=${STATUS}"
+            if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
+              echo "✅ Environnement prêt."
+              exit 0
             fi
-
-            if [ $ELAPSED -ge $LIMIT ]; then
-              echo "❌ Timeout (pré-déploiement). Derniers évènements EB :"
-              aws elasticbeanstalk describe-events \
-                --region "${AWS_REGION}" \
-                --environment-name "${ENV_NAME}" \
-                --start-time "$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
-                --max-records 200 \
-                --query 'Events[].{Time:EventDate,Sev:Severity,Msg:Message}' \
-                --output table || true
-              exit 1
-            fi
-
-            sleep $STEP
-            ELAPSED=$((ELAPSED+STEP))
+            sleep 10
           done
+          echo "❌ ${ENV_NAME} pas prêt après ~10 min"
+          exit 1
 
-      # --- DEPLOIEMENT ---
       - name: Déployer sur l’environnement (update-environment)
         shell: bash
         run: |
           set -euo pipefail
+          echo "🚀 Mise à jour ${ENV_NAME} vers label: ${{ steps.appver.outputs.label }}"
           aws elasticbeanstalk update-environment \
+            --region "${AWS_REGION}" \
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
-      # --- ATTENTE APRES DEPLOIEMENT ---
-      - name: Attendre READY/GREEN (post-déploiement)
+      # ********* C’EST ICI QU’ON ALLONGE LE TIMEOUT GITHUB *********
+      - name: Attendre que l’environnement soit GREEN (post-déploiement)
+        timeout-minutes: 90
         shell: bash
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ENV_NAME:   ${{ env.ENV_NAME }}
         run: |
           set -euo pipefail
-          LIMIT=$((30*60))  # 30 min max
-          STEP=10
-          ELAPSED=0
-          echo "⏳ Attente que ${ENV_NAME} retourne à READY/GREEN APRES update-environment…"
-
-          while :; do
-            # Demande groupée, puis parsing dans le bon ordre (Health puis Status)
-            OUT="$(aws elasticbeanstalk describe-environments \
+          END=$((SECONDS + 90*60))
+          echo "⏳ Post-déploiement : on attend le retour en Ready/Green (timeout 90 min)…"
+          while (( SECONDS < END )); do
+            # AWS renvoie "Green<TAB>Ready" => Health puis Status
+            read HEALTH STATUS <<<"$(aws elasticbeanstalk describe-environments \
+              --region "${AWS_REGION}" \
               --environment-names "${ENV_NAME}" \
               --query 'Environments[0].[Health,Status]' --output text)"
-            HEALTH=$(echo "$OUT" | awk '{print $1}')
-            STATUS=$(echo "$OUT" | awk '{print $2}')
-            echo "Etat: $STATUS / Santé: $HEALTH"
-
-            if [ "$STATUS" = "Ready" ] && [ "$HEALTH" = "Green" ]; then
-              echo "✅ Environnement prêt (post-déploiement)."
-              break
+            echo "$(date -u '+%H:%M:%S') HEALTH=${HEALTH} STATUS=${STATUS}"
+            if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
+              echo "✅ Environnement prêt après update."
+              exit 0
             fi
-
-            if [ $ELAPSED -ge $LIMIT ]; then
-              echo "❌ Timeout (post-déploiement). Derniers évènements EB :"
-              aws elasticbeanstalk describe-events \
-                --region "${AWS_REGION}" \
-                --environment-name "${ENV_NAME}" \
-                --start-time "$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
-                --max-records 200 \
-                --query 'Events[].{Time:EventDate,Sev:Severity,Msg:Message}' \
-                --output table || true
-              exit 1
-            fi
-
-            sleep $STEP
-            ELAPSED=$((ELAPSED+STEP))
+            sleep 10
           done
 
-      # --- SMOKE TEST ---
-      - name: Test de fumée (/health) avec retries et fallback
-        shell: bash
-        run: |
-          set -euo pipefail
-          CNAME="$(aws elasticbeanstalk describe-environments \
-            --environment-names "${ENV_NAME}" \
-            --query 'Environments[0].CNAME' --output text)"
-          echo "CNAME: $CNAME"
-
-          URLS=("https://${CNAME}/health" "http://${CNAME}/health")
-          ATTEMPTS=20
-
-          for URL in "${URLS[@]}"; do
-            echo "🔎 Test: $URL"
-            for i in $(seq 1 $ATTEMPTS); do
-              code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL" || true)
-              echo "Tentative $i/$ATTEMPTS -> HTTP $code"
-              if [ "$code" = "200" ]; then
-                echo "✅ Smoke test OK ($URL)"
-                exit 0
-              fi
-              sleep $((i<10 ? 3 : 6))
-            done
-          done
-
-          echo "❌ Smoke test KO. Derniers évènements EB :"
+          echo "❌ Timeout  post-déploiement (Ready/Green non atteint)."
+          echo "📋 Derniers évènements Elastic Beanstalk (30 min) :"
           aws elasticbeanstalk describe-events \
             --region "${AWS_REGION}" \
             --environment-name "${ENV_NAME}" \
@@ -217,3 +163,46 @@ jobs:
             --query 'Events[].{Time:EventDate,Sev:Severity,Msg:Message}' \
             --output table || true
           exit 1
+
+      - name: Test de fumée (/health) avec retries + fallback HTTP
+        shell: bash
+        run: |
+          set -euo pipefail
+          CNAME="$(aws elasticbeanstalk describe-environments \
+            --region "${AWS_REGION}" \
+            --environment-names "${ENV_NAME}" \
+            --query 'Environments[0].CNAME' --output text)"
+          if [[ -z "$CNAME" || "$CNAME" == "None" ]]; then
+            echo "❌ CNAME introuvable"; exit 1
+          fi
+
+          URLS=("https://${CNAME}/health" "http://${CNAME}/health")
+          echo "🔎 Smoke test sur: ${URLS[*]}"
+
+          ok="false"
+          for url in "${URLS[@]}"; do
+            for i in {1..30}; do
+              code=$(curl -sk -o /dev/null -w "%{http_code}" "$url" || true)
+              echo "Tentative $i → $url → $code"
+              if [[ "$code" == "200" ]]; then
+                ok="true"
+                break
+              fi
+              sleep $((i<10 ? 3 : (i<20 ? 6 : 10)))
+            done
+            [[ "$ok" == "true" ]] && break
+          done
+
+          if [[ "$ok" != "true" ]]; then
+            echo "❌ Smoke test KO. Dump des évènements (15 min) :"
+            aws elasticbeanstalk describe-events \
+              --region "${AWS_REGION}" \
+              --environment-name "${ENV_NAME}" \
+              --start-time "$(date -u -d '15 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
+              --max-records 200 \
+              --query 'Events[].{Time:EventDate,Sev:Severity,Msg:Message}' \
+              --output table || true
+            exit 1
+          fi
+
+          echo "✅ Smoke test OK"
