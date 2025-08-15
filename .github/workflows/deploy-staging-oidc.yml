@@ -5,9 +5,9 @@ on:
     branches: [ staging ]
   workflow_dispatch:
 
-# Évite les déploiements concurrents qui se marchent dessus
+# Empêche 2 déploiements de s'écraser
 concurrency:
-  group: eb-staging
+  group: deploy-staging
   cancel-in-progress: true
 
 permissions:
@@ -56,34 +56,31 @@ jobs:
       - name: Build (facultatif)
         run: npm run build --if-present
 
-      - name: Créer l’archive à déployer
+      - name: Pack ZIP (exclusion auto de l’archive)
         id: pack
         shell: bash
         run: |
           set -euo pipefail
           TS="$(date +%Y%m%d_%H%M%S)"
           SHA="${GITHUB_SHA::7}"
-          ZIP="rcvo-${SHA}-${TS}.zip"
+          ZIP="app-${SHA}-${TS}.zip"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
-          # exclure .git, node_modules et l’archive elle-même
           zip -r "$ZIP" . -x ".git/*" "node_modules/*" "$ZIP"
 
-      - name: Déterminer le bucket EB (idempotent)
+      - name: Bucket EB (idempotent)
         id: bucket
         shell: bash
         run: |
           set -euo pipefail
-          BUCKET="$(aws elasticbeanstalk create-storage-location --query S3Bucket --output text)"
-          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
-          echo "Bucket EB: $BUCKET"
+          BKT="$(aws elasticbeanstalk create-storage-location --query S3Bucket --output text)"
+          echo "bucket=$BKT" >> "$GITHUB_OUTPUT"
 
-      - name: Upload vers S3
-        shell: bash
+      - name: Upload S3
         run: |
-          set -euo pipefail
-          aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
+          aws s3 cp "${{ steps.pack.outputs.zip }}" \
+            "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
 
-      - name: Créer / enregistrer la version d’appli (idempotent)
+      - name: Créer/Enregistrer la version EB (idempotent)
         id: appver
         shell: bash
         run: |
@@ -93,106 +90,109 @@ jobs:
             --application-name "${APP_NAME}" \
             --version-label "$LABEL" \
             --source-bundle S3Bucket="${{ steps.bucket.outputs.bucket }}",S3Key="${{ steps.pack.outputs.zip }}" \
-          || echo "Version déjà existante, on continue."
+          || echo "Version déjà existante"
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
-      # ---------- GARDE-FOU AVANT UPDATE ----------
+      # ===== PRÉ-DÉPLOIEMENT : s'assurer que l'env est prêt =====
       - name: Attendre READY/GREEN (pré-déploiement)
         shell: bash
         run: |
           set -euo pipefail
-          deadline=$((SECONDS + 600))  # 10 min
-          while (( SECONDS < deadline )); do
-            read HEALTH STATUS <<<"$(aws elasticbeanstalk describe-environments \
+          for i in {1..60}; do  # ~10 minutes
+            read -r HEALTH STATUS VERSION <<<"$(aws elasticbeanstalk describe-environments \
               --environment-names "${ENV_NAME}" \
-              --query 'Environments[0].[Health,Status]' \
-              --output text)"
-            echo "Pré-déploiement => HEALTH=$HEALTH  STATUS=$STATUS"
+              --query 'Environments[0].[Health,Status,VersionLabel]' --output text)"
+            echo "PRE  Health=${HEALTH}  Status=${STATUS}  Version=${VERSION}"
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
-              echo "OK: environnement prêt pour update."
-              break
+              exit 0
             fi
             sleep 10
           done
-          if [[ "$STATUS" != "Ready" || "$HEALTH" != "Green" ]]; then
-            echo "❌ ${ENV_NAME} n'est pas prêt après 10 min."
-            aws elasticbeanstalk describe-events --environment-name "${ENV_NAME}" --max-items 50 || true
-            exit 1
-          fi
-          # marge anti 'Must be Ready'
-          sleep 45
+          echo "❌ ${ENV_NAME} non prêt (pré-déploiement)"; exit 1
 
-      - name: Déployer sur l’environnement (update-environment avec retries)
+      # ===== DÉPLOIEMENT : n'update que si la version diffère =====
+      - name: Déployer sur l’environnement (si nécessaire)
+        id: maybe_update
         shell: bash
         run: |
           set -euo pipefail
-          LABEL="${{ steps.appver.outputs.label }}"
-          for attempt in {1..6}; do
-            echo "update-environment (tentative $attempt) -> $LABEL"
-            if aws elasticbeanstalk update-environment \
+          TARGET="${{ steps.appver.outputs.label }}"
+          CURRENT="$(aws elasticbeanstalk describe-environments \
+            --environment-names "${ENV_NAME}" \
+            --query 'Environments[0].VersionLabel' --output text)"
+          echo "Version courante : ${CURRENT}"
+          echo "Version cible    : ${TARGET}"
+          if [[ "${CURRENT}" == "${TARGET}" ]]; then
+            echo "skip_update=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Version déjà déployée, on n'update pas."
+          else
+            echo "skip_update=false" >> "$GITHUB_OUTPUT"
+            aws elasticbeanstalk update-environment \
               --environment-name "${ENV_NAME}" \
-              --version-label "$LABEL"; then
-              echo "Commande envoyée."
-              exit 0
-            fi
-            echo "update-environment a échoué, on attend et on retente…"
-            sleep $((attempt * 15))
-          done
-          echo "❌ Impossible d'envoyer update-environment après plusieurs tentatives."
-          exit 1
+              --version-label "${TARGET}"
+            echo "▶️ update-environment lancé."
+          fi
 
-      # ---------- ATTENTE PENDANT LE DÉPLOIEMENT ----------
-      - name: Attendre que l’environnement soit GREEN
+      # ===== POST-DÉPLOIEMENT : attendre Version + Ready/Green =====
+      - name: Attendre READY/GREEN (post-déploiement)
+        if: steps.maybe_update.outputs.skip_update == 'false'
         shell: bash
         run: |
           set -euo pipefail
-          deadline=$((SECONDS + 1500))  # 25 min
-          while (( SECONDS < deadline )); do
-            read HEALTH STATUS VERSION <<<"$(aws elasticbeanstalk describe-environments \
+          TARGET="${{ steps.appver.outputs.label }}"
+          for i in {1..75}; do  # ~25 minutes
+            read -r HEALTH STATUS VERSION <<<"$(aws elasticbeanstalk describe-environments \
               --environment-names "${ENV_NAME}" \
-              --query 'Environments[0].[Health,Status,VersionLabel]' \
-              --output text)"
-            echo "Déploiement => HEALTH=$HEALTH  STATUS=$STATUS  VERSION=$VERSION"
-            if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" && "$VERSION" == "${{ steps.appver.outputs.label }}" ]]; then
-              echo "✅ Environnement Ready/Green sur la bonne version."
+              --query 'Environments[0].[Health,Status,VersionLabel]' --output text)"
+            echo "POST Health=${HEALTH}  Status=${STATUS}  Version=${VERSION}"
+            if [[ "$VERSION" == "$TARGET" && "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
+              echo "✅ Déploiement appliqué : ${VERSION}"
               exit 0
             fi
             sleep 20
           done
-          echo "❌ Timeout sur Ready/Green."
-          aws elasticbeanstalk describe-events --environment-name "${ENV_NAME}" --max-items 100 || true
+          echo "❌ Timeout : la version cible n'a pas été appliquée ou l'état n'est pas Green/Ready."
+          echo "---- Derniers événements EB ----"
+          aws elasticbeanstalk describe-events \
+            --environment-name "${ENV_NAME}" \
+            --max-items 50 \
+            --query 'Events[].{Time:EventDate,Message:Message,Severity:Severity}' --output table || true
           exit 1
 
-      # ---------- SMOKE TEST ----------
-      - name: Smoke test (/health) avec retries + fallback HTTP
+      # ===== SMOKE TEST =====
+      - name: Test de fumée (/health)
         shell: bash
         run: |
           set -euo pipefail
           CNAME="$(aws elasticbeanstalk describe-environments \
             --environment-names "${ENV_NAME}" \
-            --query 'Environments[0].CNAME' \
-            --output text)"
+            --query 'Environments[0].CNAME' --output text)"
           URL_HTTPS="https://${CNAME}/health"
           URL_HTTP="http://${CNAME}/health"
-          echo "Test santé sur: $URL_HTTPS (fallback $URL_HTTP)"
-          # 12 tentatives ~ 3 min
-          for i in {1..12}; do
-            code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL_HTTPS" || true)
-            echo "Tentative $i HTTPS -> $code"
-            if [[ "$code" == "200" ]]; then
-              echo "✅ Santé OK en HTTPS"
-              exit 0
-            fi
-            # fallback HTTP si 000/timeout/4xx
-            code2=$(curl -s -o /dev/null -w "%{http_code}" "$URL_HTTP" || true)
-            echo "Tentative $i HTTP  -> $code2"
-            if [[ "$code2" == "200" ]]; then
-              echo "✅ Santé OK en HTTP (HTTPS pas encore prêt)"
-              exit 0
-            fi
-            sleep 15
+          echo "Smoke test HTTPS: ${URL_HTTPS}"
+          OK=0
+          for i in {1..30}; do  # ~10 minutes total (backoff)
+            code=$(curl -sk -o /dev/null -w "%{http_code}" "${URL_HTTPS}" || true)
+            echo "Tentative $i - HTTPS -> $code"
+            if [[ "$code" == "200" ]]; then OK=1; break; fi
+            sleep 10
           done
-          echo "❌ Smoke test KO"
-          # dump de derniers events pour diagnostiquer
-          aws elasticbeanstalk describe-events --environment-name "${ENV_NAME}" --max-items 50 || true
-          exit 1
+          if [[ "$OK" -ne 1 ]]; then
+            echo "⚠️ HTTPS pas OK, essai HTTP (fallback)"
+            for i in {1..12}; do  # ~2 minutes
+              code=$(curl -s -o /dev/null -w "%{http_code}" "${URL_HTTP}" || true)
+              echo "Tentative $i - HTTP -> $code"
+              if [[ "$code" == "200" ]]; then OK=1; break; fi
+              sleep 10
+            done
+          fi
+          if [[ "$OK" -ne 1 ]]; then
+            echo "---- Derniers événements EB ----"
+            aws elasticbeanstalk describe-events \
+              --environment-name "${ENV_NAME}" \
+              --max-items 50 \
+              --query 'Events[].{Time:EventDate,Message:Message,Severity:Severity}' --output table || true
+            echo "❌ Smoke test KO"
+            exit 1
+          fi
+          echo "✅ Smoke test OK"
