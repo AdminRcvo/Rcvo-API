@@ -12,7 +12,7 @@ permissions:
 env:
   AWS_REGION: eu-west-3
   APP_NAME: Rcvo-backend                 # Nom exact de l'application EB
-  ENV_NAME: Rcvo-Backend-staging        # Environnement EB cible (staging)
+  ENV_NAME: Rcvo-Backend-staging         # Environnement EB cible (staging)
 
 jobs:
   deployer:
@@ -49,7 +49,7 @@ jobs:
       - name: Build (facultatif)
         run: npm run build --if-present
 
-      # ---------- Packaging & version ----------
+      # --- Packaging & publication S3 ---
       - name: Créer l’archive à déployer
         id: pack
         shell: bash
@@ -62,7 +62,7 @@ jobs:
           # Exclure .git, node_modules et l’archive elle-même
           zip -r "$ZIP" . -x ".git/*" "node_modules/*" "$ZIP"
 
-      - name: Déterminer le bucket EB (CreateStorageLocation idempotent)
+      - name: Déterminer le bucket EB (idempotent)
         id: bucket
         shell: bash
         run: |
@@ -85,12 +85,13 @@ jobs:
             --application-name "${APP_NAME}" \
             --version-label "$LABEL" \
             --source-bundle S3Bucket="${{ steps.bucket.outputs.bucket }}",S3Key="${{ steps.pack.outputs.zip }}" \
-          || echo "Version déjà existante, on continue."
+          || echo "Version déjà existante (ok)."
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
-      # ---------- Readiness AVANT déploiement ----------
-      - name: Attendre que l’environnement soit prêt (pré-déploiement)
+      # --- Attente readiness avant update (évite InvalidParameterValue: Must be Ready) ---
+      - name: Attendre que l’environnement soit READY (pré-déploiement)
         shell: bash
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           for i in {1..60}; do
@@ -100,7 +101,7 @@ jobs:
               --query 'Environments[0].[Health,Status]' \
               --output text || true)"
             echo "Sortie brute: $OUT"
-            read -r HEALTH STATUS <<<"$OUT"
+            read -r HEALTH STATUS <<<"$OUT"   # AWS renvoie Health puis Status => "Green\tReady"
             echo "STATUS=$STATUS  HEALTH=$HEALTH"
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
               echo "✅ ${ENV_NAME} est prêt."
@@ -108,10 +109,9 @@ jobs:
             fi
             sleep 10
           done
-          echo "❌ ${ENV_NAME} pas prêt après ~10 min"
-          exit 1
+          echo "❌ ${ENV_NAME} pas prêt après ~10 min"; exit 1
 
-      # ---------- Déploiement ----------
+      # --- Déploiement ---
       - name: Déployer sur l’environnement
         run: |
           aws elasticbeanstalk update-environment \
@@ -119,7 +119,7 @@ jobs:
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
-      # ---------- Readiness APRÈS déploiement ----------
+      # --- Attente readiness après update (correctif ordre Health/Status) ---
       - name: Attendre que l’environnement soit GREEN (post-déploiement)
         shell: bash
         timeout-minutes: 20
@@ -132,7 +132,7 @@ jobs:
               --query 'Environments[0].[Health,Status]' \
               --output text || true)"
             echo "Sortie brute: $OUT"
-            read -r HEALTH STATUS <<<"$OUT"
+            read -r HEALTH STATUS <<<"$OUT"   # <- IMPORTANT : Health puis Status
             echo "STATUS=$STATUS  HEALTH=$HEALTH"
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
               echo "✅ Environnement prêt."
@@ -140,11 +140,10 @@ jobs:
             fi
             sleep 10
           done
-          echo "❌ Timeout d’attente (environnement non GREEN/Ready)"
-          exit 1
+          echo "❌ Timeout d’attente (environnement non GREEN/Ready)"; exit 1
 
-      # ---------- Smoke test ----------
-      - name: Test de fumée (/health) avec retries et fallback HTTP
+      # --- Smoke test robuste (/health), avec retries et backoff simple ---
+      - name: Test de fumée (/health)
         shell: bash
         run: |
           set -euo pipefail
@@ -152,32 +151,34 @@ jobs:
             --region "${AWS_REGION}" \
             --environment-names "${ENV_NAME}" \
             --query 'Environments[0].CNAME' --output text)"
-          echo "CNAME=${CNAME}"
-          URLS=("https://${CNAME}/health" "http://${CNAME}/health")
+          URL_HTTPS="https://${CNAME}/health"
+          URL_HTTP="http://${CNAME}/health"
+          echo "Test HTTPS: $URL_HTTPS"
 
-          timeout=$((15*60))   # 15 minutes
-          interval=10
-          elapsed=0
-          ok=0
-
-          while (( elapsed < timeout )); do
-            for URL in "${URLS[@]}"; do
-              echo "Test: $URL"
-              code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL" || true)
-              echo "Code HTTP: $code"
-              if [[ "$code" == "200" ]]; then
-                echo "✅ Health check OK via $URL"
-                ok=1
-                break 2
-              fi
-            done
-            sleep $interval
-            elapsed=$((elapsed + interval))
+          ok=""
+          for i in {1..30}; do
+            code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL_HTTPS" || true)
+            echo "Tentative $i (HTTPS) : $code"
+            if [[ "$code" == "200" ]]; then ok="yes"; break; fi
+            sleep 5
           done
 
-          if [[ "$ok" -ne 1 ]]; then
-            echo "❌ Health check KO après $timeout secondes"
-            # Aide au debug : montre les en-têtes de la dernière tentative HTTPS
-            curl -skI "https://${CNAME}/health" || true
+          # Fallback HTTP si HTTPS échoue encore (cert ou listener en cours)
+          if [[ -z "$ok" ]]; then
+            echo "HTTPS non concluant, essai HTTP… ($URL_HTTP)"
+            for i in {1..12}; do
+              code=$(curl -s -o /dev/null -w "%{http_code}" "$URL_HTTP" || true)
+              echo "Tentative $i (HTTP) : $code"
+              if [[ "$code" == "200" ]]; then ok="yes"; break; fi
+              sleep 5
+            done
+          fi
+
+          if [[ -z "$ok" ]]; then
+            echo "❌ Smoke test KO (ni HTTPS ni HTTP ne répond en 200)"
+            echo "Diag rapide (1 requête verbeuse HTTPS) :"
+            curl -skv "$URL_HTTPS" || true
             exit 1
           fi
+
+          echo "✅ Smoke test OK"
