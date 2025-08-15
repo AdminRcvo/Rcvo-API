@@ -1,8 +1,8 @@
-name: Déploiement STAGING via OIDC (Elastic Beanstalk)
+name: Déploiement STAGING via OIDC (EB) v2
 
 on:
   push:
-    branches: [ main ]  # change à [ staging ] si besoin
+    branches: [ main ]     # mets [staging] si c'est ta branche de staging
   workflow_dispatch:
 
 permissions:
@@ -22,7 +22,7 @@ env:
 jobs:
   deployer:
     runs-on: ubuntu-latest
-    # ← Large marge : le job PEUT durer jusqu’à 2h si besoin
+    # marge large au niveau JOB (pas au niveau step)
     timeout-minutes: 120
 
     steps:
@@ -47,11 +47,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
       - name: Build (facultatif)
         run: npm run build --if-present
@@ -90,24 +86,21 @@ jobs:
           || echo "Version déjà existante"
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
-      - name: Attendre READY/GREEN (pré-déploiement)
+      - name: Attendre READY/GREEN avant déploiement
         shell: bash
         run: |
           set -euo pipefail
-          LIMIT=$((10*60))  # 10 minutes max avant l'update
+          LIMIT=$((10*60))  # 10 min max
           STEP=10
           ELAPSED=0
-          while true; do
+          while :; do
             OK=$(aws elasticbeanstalk describe-environments \
               --environment-names "${ENV_NAME}" \
               --query "length(Environments[?Status=='Ready' && Health=='Green'])" \
               --output text)
-            echo "PRE ▶ Ready/Green = ${OK} | ${ELAPSED}s/${LIMIT}s"
-            if [ "$OK" = "1" ]; then
-              echo "✅ ${ENV_NAME} prêt pour déploiement."
-              break
-            fi
-            [ $ELAPSED -ge $LIMIT ] && { echo "❌ Pré-déploiement: timeout"; exit 1; }
+            echo "PRE ▶ Ready/Green=${OK} | ${ELAPSED}s/${LIMIT}s"
+            [ "$OK" = "1" ] && { echo "✅ ${ENV_NAME} prêt."; break; }
+            [ $ELAPSED -ge $LIMIT ] && { echo "❌ Timeout pré-déploiement"; exit 1; }
             sleep $STEP; ELAPSED=$((ELAPSED+STEP))
           done
 
@@ -117,27 +110,26 @@ jobs:
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
-      # ⚠️ PAS DE "timeout-minutes" ici : c'est ce qui te coupait à 15 min
-      - name: Attendre que l’environnement soit GREEN
+      # ⚠️ AUCUN `timeout-minutes` ici. La step peut dépasser 15 min.
+      - name: Attendre READY/GREEN après déploiement
         shell: bash
         run: |
           set -euo pipefail
-          LIMIT=$((30*60))  # 30 minutes max post-déploiement
+          LIMIT=$((30*60))  # 30 min max
           STEP=10
           ELAPSED=0
-          while true; do
+          while :; do
             OK=$(aws elasticbeanstalk describe-environments \
               --environment-names "${ENV_NAME}" \
               --query "length(Environments[?Status=='Ready' && Health=='Green'])" \
               --output text)
-            # on parle toutes les 10s pour que le runner ne considère pas la step idle
-            echo "POST ▶ Ready/Green = ${OK} | ${ELAPSED}s/${LIMIT}s"
+            echo "POST ▶ Ready/Green=${OK} | ${ELAPSED}s/${LIMIT}s"
             if [ "$OK" = "1" ]; then
-              echo "✅ Déploiement terminé : ${ENV_NAME} Ready/Green."
+              echo "✅ Déploiement terminé (Ready/Green)."
               break
             fi
             if [ $ELAPSED -ge $LIMIT ]; then
-              echo "❌ Timeout post-déploiement (30 min). Derniers événements :"
+              echo "❌ Timeout post-déploiement → derniers événements EB :"
               aws elasticbeanstalk describe-events \
                 --environment-name "${ENV_NAME}" \
                 --start-time "$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
@@ -155,7 +147,7 @@ jobs:
             sleep $STEP; ELAPSED=$((ELAPSED+STEP))
           done
 
-      - name: Test de fumée (/health)
+      - name: Smoke test /health avec retries et fallback HTTP
         shell: bash
         run: |
           set -euo pipefail
@@ -164,21 +156,21 @@ jobs:
             --query 'Environments[0].CNAME' --output text)"
           URL_HTTPS="https://${CNAME}/health"
           URL_HTTP="http://${CNAME}/health"
-          echo "Smoke test: ${URL_HTTPS}"
+          echo "🔎 Test: ${URL_HTTPS}"
           ok=0
           for i in $(seq 1 20); do
             code=$(curl -sk -o /dev/null -w "%{http_code}" "${URL_HTTPS}" || true)
-            echo "Try ${i} HTTPS => ${code}"
-            if [ "${code}" = "200" ]; then ok=1; break; fi
+            echo "Try ${i} HTTPS ⇒ ${code}"
+            [ "${code}" = "200" ] && { ok=1; break; }
             sleep 5
           done
           if [ "${ok}" != "1" ]; then
-            echo "Fallback HTTP…"
+            echo "↪️ Fallback HTTP…"
             for i in $(seq 1 20); do
               code=$(curl -s -o /dev/null -w "%{http_code}" "${URL_HTTP}" || true)
-              echo "Try ${i} HTTP => ${code}"
-              if [ "${code}" = "200" ]; then ok=1; break; fi
+              echo "Try ${i} HTTP ⇒ ${code}"
+              [ "${code}" = "200" ] && { ok=1; break; }
               sleep 5
             done
           fi
-          [ "${ok}" = "1" ] && echo "✅ Smoke test OK." || { echo "❌ Smoke test KO"; exit 1; }
+          [ "${ok}" = "1" ] && echo "✅ Smoke test OK" || { echo "❌ Smoke test KO"; exit 1; }
