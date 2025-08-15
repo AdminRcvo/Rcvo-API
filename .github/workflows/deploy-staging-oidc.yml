@@ -22,7 +22,7 @@ env:
 jobs:
   deployer:
     runs-on: ubuntu-latest
-    timeout-minutes: 90   # ✅ plus de plafond à 15 min pour le job
+    timeout-minutes: 120   # ✅ job étendu (aucun 15 min résiduel)
 
     steps:
       - name: Checkout
@@ -46,11 +46,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
       - name: Build (facultatif)
         run: npm run build --if-present
@@ -100,12 +96,10 @@ jobs:
           set -euo pipefail
           echo "⏳ Pré-déploiement: ${ENV_NAME} doit être Ready & Green/Ok…"
           for i in $(seq 1 "$MAX_LOOPS"); do
-            OUT="$(aws elasticbeanstalk describe-environments \
+            read HEALTH STATUS <<<"$(aws elasticbeanstalk describe-environments \
               --region "${AWS_REGION}" \
               --environment-names "${ENV_NAME}" \
               --query 'Environments[0].[Health,Status]' --output text)"
-            HEALTH="$(echo "$OUT" | awk '{print $1}')"
-            STATUS="$(echo "$OUT" | awk '{print $2}')"
             echo "(${i}) HEALTH=${HEALTH}  STATUS=${STATUS}"
             if [[ "$STATUS" == "Ready" && ( "$HEALTH" == "Green" || "$HEALTH" == "Ok" ) ]]; then
               echo "✅ Environnement prêt pour déployer."
@@ -122,17 +116,14 @@ jobs:
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
-      # ---- Attente post-déploiement : waiter + boucle; step étendue à 90 min
-      - name: Attendre que l’environnement soit GREEN
-        timeout-minutes: 90   # ✅ écrase tout ancien 15 min résiduel
+      # ====== ICI : NOUVELLE STEP SANS TIMEOUT 15m ======
+      - name: Attendre READY/GREEN (post-déploiement) — NO TIMEOUT
         shell: bash
         env:
           READY_WAIT_SEC: "20"
         run: |
           set -euo pipefail
-
           echo "::group::⏳ Waiter environment-updated (EB)"
-          # Attente côté EB que l'update soit terminé (status Ready)
           aws elasticbeanstalk wait environment-updated \
             --region "${AWS_REGION}" \
             --environment-names "${ENV_NAME}"
@@ -140,12 +131,10 @@ jobs:
 
           echo "::group::🔁 Boucle Ready + Green/Ok"
           while : ; do
-            OUT="$(aws elasticbeanstalk describe-environments \
+            read HEALTH STATUS <<<"$(aws elasticbeanstalk describe-environments \
               --region "${AWS_REGION}" \
               --environment-names "${ENV_NAME}" \
               --query 'Environments[0].[Health,Status]' --output text)"
-            HEALTH="$(echo "$OUT" | awk '{print $1}')"
-            STATUS="$(echo "$OUT" | awk '{print $2}')"
             echo "$(date '+%H:%M:%S')  HEALTH=${HEALTH}  STATUS=${STATUS}"
             if [[ "${STATUS}" == "Ready" && ( "${HEALTH}" == "Green" || "${HEALTH}" == "Ok" ) ]]; then
               echo "✅ Environnement prêt."
@@ -154,6 +143,7 @@ jobs:
             sleep "${READY_WAIT_SEC}"
           done
           echo "::endgroup::"
+      # ================================================
 
       - name: Test de fumée (/health) avec retries + fallback
         shell: bash
@@ -166,7 +156,6 @@ jobs:
             --environment-names "${ENV_NAME}" \
             --query 'Environments[0].CNAME' --output text)"
           echo "CNAME=${CNAME}"
-
           URLS=("https://${CNAME}/health" "http://${CNAME}/health")
           for URL in "${URLS[@]}"; do
             echo "🌐 Test: $URL"
@@ -188,7 +177,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "📜 Derniers événements EB (30 min)…"
           aws elasticbeanstalk describe-events \
             --region "${AWS_REGION}" \
             --environment-name "${ENV_NAME}" \
@@ -202,13 +190,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "📦 Demande bundle logs…"
           aws elasticbeanstalk request-environment-info \
             --region "${AWS_REGION}" \
             --environment-name "${ENV_NAME}" \
             --info-type tail || true
           sleep 20
-          echo "⬇️  Liens de logs:"
           aws elasticbeanstalk retrieve-environment-info \
             --region "${AWS_REGION}" \
             --environment-name "${ENV_NAME}" \
