@@ -1,8 +1,8 @@
-name: Déploiement STAGING sur Elastic Beanstalk (OIDC)
+name: Déploiement STAGING (OIDC) - Rcvo Backend
 
 on:
   push:
-    branches: [ main ]   # change à [ staging ] si tu veux déclencher sur la branche "staging"
+    branches: [ staging ]
   workflow_dispatch:
 
 permissions:
@@ -11,8 +11,8 @@ permissions:
 
 env:
   AWS_REGION: eu-west-3
-  APP_NAME: Rcvo-backend                 # Nom exact de l'application EB
-  ENV_NAME: Rcvo-Backend-staging         # Mets rcvo-backend-prod pour prod
+  APP_NAME: Rcvo-backend                 # Nom EXACT de l'application Elastic Beanstalk
+  ENV_NAME: Rcvo-Backend-staging         # Environnement STAGING EB
 
 jobs:
   deployer:
@@ -31,7 +31,7 @@ jobs:
       - name: Vérifier l’identité AWS
         run: aws sts get-caller-identity
 
-      - name: Installer Node.js 22
+      - name: Installer Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -43,6 +43,7 @@ jobs:
           if [ -f package-lock.json ]; then
             npm ci
           else
+            echo "⚠️  package-lock.json absent → npm install"
             npm install
           fi
 
@@ -58,7 +59,7 @@ jobs:
           SHA="${GITHUB_SHA::7}"
           ZIP="app-${SHA}-${TS}.zip"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
-          # Exclure .git, node_modules et l'archive elle-même
+          # Exclure .git, node_modules et l’archive elle-même
           zip -r "$ZIP" . -x ".git/*" "node_modules/*" "$ZIP"
 
       - name: Déterminer le bucket EB (CreateStorageLocation idempotent)
@@ -66,15 +67,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BUCKET="$(aws elasticbeanstalk create-storage-location \
-            --region "${AWS_REGION}" \
-            --query S3Bucket --output text)"
+          BUCKET="$(aws elasticbeanstalk create-storage-location --region "${AWS_REGION}" --query S3Bucket --output text)"
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
 
       - name: Upload vers S3
         run: |
-          aws s3 cp "${{ steps.pack.outputs.zip }}" \
-            "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
+          aws s3 cp "./${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
 
       - name: Créer/Enregistrer la version d’appli
         id: appver
@@ -87,118 +85,111 @@ jobs:
             --application-name "${APP_NAME}" \
             --version-label "$LABEL" \
             --source-bundle S3Bucket="${{ steps.bucket.outputs.bucket }}",S3Key="${{ steps.pack.outputs.zip }}" \
-          || echo "Version déjà existante, on continue."
+          || echo "ℹ️  Version déjà existante, on continue."
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
+      # ---------- ATTENTE PRE-DEPLOIEMENT ----------
       - name: Attendre que l'environnement soit prêt (pré-déploiement)
         shell: bash
         run: |
           set -euo pipefail
-          for i in {1..30}; do
-            # On récupère Status et Health séparément pour éviter tout swap
-            STATUS="$(aws elasticbeanstalk describe-environments \
+          ENV_NAME="${ENV_NAME}"
+          TIMEOUT=$((15*60))   # 15 minutes max
+          INTERVAL=10
+          ELAPSED=0
+
+          echo "⏳ Attente que l'environnement $ENV_NAME soit Ready & Green (pré-déploiement)..."
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            OUT="$(aws elasticbeanstalk describe-environments \
               --region "${AWS_REGION}" \
-              --environment-names "${ENV_NAME}" \
-              --query 'Environments[0].Status' --output text)"
-            HEALTH="$(aws elasticbeanstalk describe-environments \
-              --region "${AWS_REGION}" \
-              --environment-names "${ENV_NAME}" \
-              --query 'Environments[0].Health' --output text)"
+              --environment-names "$ENV_NAME" \
+              --query 'Environments[0].[Health,Status]' \
+              --output text)"
+            HEALTH=$(echo "$OUT" | awk '{print $1}')   # Green
+            STATUS=$(echo "$OUT" | awk '{print $2}')   # Ready
             echo "STATUS=$STATUS  HEALTH=$HEALTH"
+
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
-              echo "✅ ${ENV_NAME} est prêt."
-              exit 0
+              echo "✅ $ENV_NAME est prêt."
+              break
             fi
-            sleep 10
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
           done
-          echo "❌ ${ENV_NAME} pas prêt après ~5 min"; exit 1
+
+          if [[ "$STATUS" != "Ready" || "$HEALTH" != "Green" ]]; then
+            echo "❌ $ENV_NAME pas prêt après $((TIMEOUT/60)) min"
+            exit 1
+          fi
 
       - name: Déployer sur l’environnement
         run: |
           aws elasticbeanstalk update-environment \
-            --region "${{ env.AWS_REGION }}" \
+            --region "${AWS_REGION}" \
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
+      # ---------- ATTENTE POST-DEPLOIEMENT ----------
       - name: Attendre que l’environnement soit GREEN
         shell: bash
         timeout-minutes: 20
         run: |
           set -euo pipefail
-          for i in {1..60}; do
-            HEALTH="$(aws elasticbeanstalk describe-environments \
+          ENV_NAME="${ENV_NAME}"
+          TIMEOUT=$((20*60))  # 20 minutes
+          INTERVAL=20
+          ELAPSED=0
+
+          echo "⏳ Attente post-déploiement (Ready & Green)..."
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            OUT="$(aws elasticbeanstalk describe-environments \
               --region "${AWS_REGION}" \
-              --environment-names "${ENV_NAME}" \
-              --query 'Environments[0].Health' --output text)"
-            STATUS="$(aws elasticbeanstalk describe-environments \
-              --region "${AWS_REGION}" \
-              --environment-names "${ENV_NAME}" \
-              --query 'Environments[0].Status' --output text)"
-            echo "HEALTH=$HEALTH  STATUS=$STATUS"
+              --environment-names "$ENV_NAME" \
+              --query 'Environments[0].[Health,Status]' \
+              --output text)"
+            HEALTH=$(echo "$OUT" | awk '{print $1}')   # Green
+            STATUS=$(echo "$OUT" | awk '{print $2}')   # Ready
+            echo "STATUS=$STATUS  HEALTH=$HEALTH"
+
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
               echo "✅ Environnement prêt."
               exit 0
             fi
-            sleep 20
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
           done
-          echo "❌ Timeout en attente de GREEN"; exit 1
 
-      - name: Test de fumée (/health) — retries 15 min + fallback HTTP
+          echo "❌ Timeout post-déploiement"
+          exit 1
+
+      - name: Test de fumée (/health) avec retries
         shell: bash
         run: |
           set -euo pipefail
-
           CNAME="$(aws elasticbeanstalk describe-environments \
             --region "${AWS_REGION}" \
             --environment-names "${ENV_NAME}" \
             --query 'Environments[0].CNAME' --output text)"
-
-          if [[ -z "${CNAME:-}" || "${CNAME}" == "None" ]]; then
-            echo "❌ CNAME vide, impossible de tester"
-            exit 1
-          fi
-
           URL="https://${CNAME}/health"
-          echo "Test de santé sur: $URL"
+          echo "🔎 Test: $URL"
 
-          timeout=$((15*60))   # 15 minutes
+          timeout=$((15*60))  # 15 min max
           interval=10
           elapsed=0
-          ok=0
 
           while (( elapsed < timeout )); do
-            code="$(curl -sk -o /dev/null -w "%{http_code}" "$URL" || true)"
-            echo "⏳ ${elapsed}s — HTTPS code: ${code}"
+            code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL" || true)
+            echo "Tentative $((elapsed/interval+1)) : code HTTP = $code"
             if [[ "$code" == "200" ]]; then
-              echo "✅ Health check OK (HTTPS)"
-              ok=1
-              break
+              echo "✅ Health check OK"
+              exit 0
             fi
-            sleep "$interval"
+            sleep $interval
             elapsed=$((elapsed + interval))
           done
 
-          if [[ "$ok" -eq 0 ]]; then
-            echo "❌ HTTPS toujours KO après ${timeout}s — détails CURL :"
-            curl -skv "$URL" || true
-
-            echo "⛑️  Fallback HTTP (au cas où le 443 n'est pas prêt) ..."
-            URL_FALLBACK="http://${CNAME}/health"
-            elapsed=0
-            while (( elapsed < timeout )); do
-              code="$(curl -s -o /dev/null -w "%{http_code}" "$URL_FALLBACK" || true)"
-              echo "⏳ ${elapsed}s — HTTP code: ${code}"
-              if [[ "$code" == "200" ]]; then
-                echo "✅ Health check OK (HTTP fallback)"
-                ok=1
-                break
-              fi
-              sleep "$interval"
-              elapsed=$((elapsed + interval))
-            done
-          fi
-
-          if [[ "$ok" -ne 1 ]]; then
-            echo "❌ Health check failed après ${timeout}s (HTTPS et HTTP)"
-            exit 1
-          fi
+          echo "❌ Health check KO après $timeout secondes"
+          echo "— Diagnostic rapide —"
+          echo "CNAME: $CNAME"
+          echo "Dernier code: $code"
+          exit 1
