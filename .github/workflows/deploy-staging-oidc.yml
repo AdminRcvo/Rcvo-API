@@ -11,8 +11,8 @@ permissions:
 
 env:
   AWS_REGION: eu-west-3
-  APP_NAME: Rcvo-backend                 # Nom exact de l'application EB
-  ENV_NAME: Rcvo-Backend-staging         # Environnement EB cible (staging)
+  APP_NAME: Rcvo-backend                 # nom exact de l'application EB
+  ENV_NAME: Rcvo-Backend-staging         # environnement EB cible
 
 jobs:
   deployer:
@@ -49,7 +49,7 @@ jobs:
       - name: Build (facultatif)
         run: npm run build --if-present
 
-      # --- Packaging & publication S3 ---
+      # --- Packaging & upload S3 ---
       - name: Créer l’archive à déployer
         id: pack
         shell: bash
@@ -88,20 +88,15 @@ jobs:
           || echo "Version déjà existante (ok)."
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
-      # --- Attente readiness avant update (évite InvalidParameterValue: Must be Ready) ---
-      - name: Attendre que l’environnement soit READY (pré-déploiement)
+      # --- Attente READINESS avant update (évite 'Must be Ready') ---
+      - name: Attendre READY/GREEN (pré-déploiement)
         shell: bash
         timeout-minutes: 10
         run: |
           set -euo pipefail
           for i in {1..60}; do
-            OUT="$(aws elasticbeanstalk describe-environments \
-              --region "${AWS_REGION}" \
-              --environment-names "${ENV_NAME}" \
-              --query 'Environments[0].[Health,Status]' \
-              --output text || true)"
-            echo "Sortie brute: $OUT"
-            read -r HEALTH STATUS <<<"$OUT"   # AWS renvoie Health puis Status => "Green\tReady"
+            STATUS="$(aws elasticbeanstalk describe-environments --region "${AWS_REGION}" --environment-names "${ENV_NAME}" --query 'Environments[0].Status' --output text || true)"
+            HEALTH="$(aws  elasticbeanstalk describe-environments --region "${AWS_REGION}" --environment-names "${ENV_NAME}" --query 'Environments[0].Health' --output text || true)"
             echo "STATUS=$STATUS  HEALTH=$HEALTH"
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
               echo "✅ ${ENV_NAME} est prêt."
@@ -119,20 +114,15 @@ jobs:
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
-      # --- Attente readiness après update (correctif ordre Health/Status) ---
-      - name: Attendre que l’environnement soit GREEN (post-déploiement)
+      # --- Attente READINESS après update (requêtes séparées -> zéro ambiguïté) ---
+      - name: Attendre que l’environnement soit GREEN
         shell: bash
-        timeout-minutes: 20
+        timeout-minutes: 25
         run: |
           set -euo pipefail
-          for i in {1..90}; do
-            OUT="$(aws elasticbeanstalk describe-environments \
-              --region "${AWS_REGION}" \
-              --environment-names "${ENV_NAME}" \
-              --query 'Environments[0].[Health,Status]' \
-              --output text || true)"
-            echo "Sortie brute: $OUT"
-            read -r HEALTH STATUS <<<"$OUT"   # <- IMPORTANT : Health puis Status
+          for i in {1..150}; do   # 150 * 10s = ~25 min
+            STATUS="$(aws elasticbeanstalk describe-environments --region "${AWS_REGION}" --environment-names "${ENV_NAME}" --query 'Environments[0].Status' --output text || true)"
+            HEALTH="$(aws  elasticbeanstalk describe-environments --region "${AWS_REGION}" --environment-names "${ENV_NAME}" --query 'Environments[0].Health' --output text || true)"
             echo "STATUS=$STATUS  HEALTH=$HEALTH"
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
               echo "✅ Environnement prêt."
@@ -142,7 +132,7 @@ jobs:
           done
           echo "❌ Timeout d’attente (environnement non GREEN/Ready)"; exit 1
 
-      # --- Smoke test robuste (/health), avec retries et backoff simple ---
+      # --- Smoke test robuste /health (HTTPS puis fallback HTTP) ---
       - name: Test de fumée (/health)
         shell: bash
         run: |
@@ -163,7 +153,6 @@ jobs:
             sleep 5
           done
 
-          # Fallback HTTP si HTTPS échoue encore (cert ou listener en cours)
           if [[ -z "$ok" ]]; then
             echo "HTTPS non concluant, essai HTTP… ($URL_HTTP)"
             for i in {1..12}; do
