@@ -16,12 +16,13 @@ concurrency:
 env:
   AWS_REGION: eu-west-3
   APP_NAME: Rcvo-backend
-  # <<< ADAPTE ICI SI BESOIN : rcvo-backend-prod / Rcvo-Backend-env >>>
+  # <<< CHANGE ICI si tu veux déployer ailleurs (rcvo-backend-prod / Rcvo-Backend-env) >>>
   ENV_NAME: Rcvo-Backend-lb
 
 jobs:
   deployer:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,6 +35,30 @@ jobs:
 
       - name: Vérifier l’identité AWS
         run: aws sts get-caller-identity
+
+      # ---------- Sécurité : valider que l'environnement existe ----------
+      - name: Vérifier que l’environnement cible existe
+        id: envcheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENV="${ENV_NAME}"
+          OUT="$(aws elasticbeanstalk describe-environments \
+            --region "${AWS_REGION}" \
+            --application-name "${APP_NAME}" \
+            --query "Environments[?EnvironmentName=='${ENV}'].{Name:EnvironmentName,Status:Status,Health:Health}" \
+            --output text || true)"
+          echo "Lookup: $OUT"
+          if [[ -z "$OUT" ]]; then
+            echo "❌ Environnement '${ENV}' introuvable dans l'appli '${APP_NAME}' (region ${AWS_REGION})."
+            echo "📋 Environnements existants :"
+            aws elasticbeanstalk describe-environments \
+              --region "${AWS_REGION}" \
+              --application-name "${APP_NAME}" \
+              --query "Environments[].{Name:EnvironmentName,Status:Status,Health:Health}" \
+              --output table || true
+            exit 1
+          fi
 
       - name: Installer Node.js
         uses: actions/setup-node@v4
@@ -63,7 +88,7 @@ jobs:
       - name: Déterminer le bucket EB (CreateStorageLocation idempotent)
         id: bucket
         run: |
-          BUCKET="$(aws elasticbeanstalk create-storage-location --query S3Bucket --output text)"
+          BUCKET="$(aws elasticbeanstalk create-storage-location --region "${AWS_REGION}" --query S3Bucket --output text)"
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
 
       - name: Upload vers S3
@@ -76,13 +101,14 @@ jobs:
           set -euo pipefail
           LABEL="${{ steps.pack.outputs.zip }}"
           aws elasticbeanstalk create-application-version \
+            --region "${AWS_REGION}" \
             --application-name "${APP_NAME}" \
             --version-label "$LABEL" \
             --source-bundle S3Bucket="${{ steps.bucket.outputs.bucket }}",S3Key="${{ steps.pack.outputs.zip }}" \
           || echo "Version déjà existante"
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
-      # ----------- PRÉ-DÉPLOIEMENT : on attend seulement Status=Ready -----------
+      # ----------- PRÉ-DÉPLOIEMENT : attendre uniquement Status=Ready -----------
       - name: Attendre READY (pré-déploiement)
         shell: bash
         run: |
@@ -91,6 +117,7 @@ jobs:
           MAX=120   # ~20 minutes (120 * 10s)
           for i in $(seq 1 $MAX); do
             OUT="$(aws elasticbeanstalk describe-environments \
+              --region "${AWS_REGION}" \
               --environment-names "$ENV" \
               --query 'Environments[0].[Status,Health]' --output text || true)"
             STATUS="$(echo "$OUT" | awk '{print $1}')"
@@ -107,10 +134,11 @@ jobs:
       - name: Déployer sur l’environnement
         run: |
           aws elasticbeanstalk update-environment \
+            --region "${AWS_REGION}" \
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
-      # ----------- POST-DÉPLOIEMENT : on attend Ready + Green (parsing correct) -----------
+      # ----------- POST-DÉPLOIEMENT : attendre Ready + Green (parsing correct) -----------
       - name: Attendre GREEN (post-déploiement)
         shell: bash
         run: |
@@ -119,19 +147,20 @@ jobs:
           MAX=90    # ~30 minutes (90 * 20s)
           for i in $(seq 1 $MAX); do
             OUT="$(aws elasticbeanstalk describe-environments \
+              --region "${AWS_REGION}" \
               --environment-names "$ENV" \
               --query 'Environments[0].[Health,Status]' --output text || true)"
-            HEALTH="$(echo "$OUT" | awk '{print $1}')"   # EB renvoie Health puis Status
+            HEALTH="$(echo "$OUT" | awk '{print $1}')"   # EB renvoie Health d'abord
             STATUS="$(echo "$OUT" | awk '{print $2}')"
             echo "HEALTH=$HEALTH  STATUS=$STATUS"
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
               echo "✅ $ENV est GREEN & READY."
               exit 0
             fi
-            # Dump d’évènements périodique pour diagnostic
             if (( i % 6 == 0 )); then
               echo "--- Derniers évènements EB (10 min) ---"
               aws elasticbeanstalk describe-events \
+                --region "${AWS_REGION}" \
                 --environment-name "$ENV" \
                 --start-time "$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
                 --max-records 50 \
@@ -147,6 +176,7 @@ jobs:
         run: |
           set -euo pipefail
           CNAME="$(aws elasticbeanstalk describe-environments \
+            --region "${AWS_REGION}" \
             --environment-names "${ENV_NAME}" \
             --query 'Environments[0].CNAME' --output text)"
           for SCHEME in https http; do
