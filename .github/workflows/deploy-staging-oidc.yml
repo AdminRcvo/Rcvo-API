@@ -2,27 +2,30 @@ name: Déploiement STAGING via OIDC (Elastic Beanstalk)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main ]           # adapte si tu veux une autre branche
   workflow_dispatch:
 
-permissions:
-  id-token: write
-  contents: read
-
+# Evite les déploiements concurrents qui se marchent dessus
 concurrency:
-  group: eb-staging
+  group: eb-staging-${{ github.ref }}
   cancel-in-progress: false
+
+permissions:
+  id-token: write                # OIDC
+  contents: read
 
 env:
   AWS_REGION: eu-west-3
-  ROLE_ARN: arn:aws:iam::409818814260:role/GithubOIDCRcvoDeploy
   APP_NAME: Rcvo-backend
   ENV_NAME: Rcvo-Backend-staging
-  HEALTH_PATH: /health
+  ROLE_ARN: arn:aws:iam::409818814260:role/GithubOIDCRcvoDeploy
 
 jobs:
   deployer:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -eo pipefail {0}
 
     steps:
       - name: Checkout
@@ -34,205 +37,175 @@ jobs:
           role-to-assume: ${{ env.ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Vérifier identité AWS
+      - name: Vérifier l’identité AWS
         run: aws sts get-caller-identity
-
-      - name: Installer outils (jq, zip, curl)
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq zip curl
-
-      - name: Vérifier que l’environnement EB existe et n’est pas en fin de vie
-        shell: bash
-        run: |
-          set -euo pipefail
-          OUT="$(aws elasticbeanstalk describe-environments \
-            --application-name "${APP_NAME}" \
-            --environment-names "${ENV_NAME}" \
-            --query 'Environments[0].{Status:Status,Health:Health}' --output json || true)"
-          if [[ -z "$OUT" || "$OUT" == "null" ]]; then
-            echo "❌ L'environnement '${ENV_NAME}' n'existe pas."
-            echo "Crée-le d'abord (console AWS ou CLI), puis relance le workflow."
-            exit 1
-          fi
-          STATUS="$(echo "$OUT" | jq -r '.Status')"
-          HEALTH="$(echo "$OUT" | jq -r '.Health')"
-          echo "Etat actuel: STATUS=${STATUS} | HEALTH=${HEALTH}"
-
-          if [[ "$STATUS" == "Terminated" || "$STATUS" == "Terminating" ]]; then
-            echo "❌ L'environnement est en état '${STATUS}'. Attends qu'il soit 'Ready' ou recrée-le avant de déployer."
-            exit 1
-          fi
 
       - name: Installer Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
 
-      - name: Installer dépendances
-        shell: bash
+      - name: Installer dépendances (lockfile si présent)
         run: |
-          set -euo pipefail
           if [[ -f package-lock.json ]]; then
             npm ci
           else
             npm install
           fi
 
-      - name: Build (si script présent)
+      - name: Build (facultatif)
         run: npm run build --if-present
 
-      - name: Pack ZIP à déployer
+      - name: Créer l’archive à déployer
         id: pack
-        shell: bash
         run: |
-          set -euo pipefail
           TS="$(date +%Y%m%d_%H%M%S)"
           SHA="${GITHUB_SHA::7}"
           ZIP="app-${SHA}-${TS}.zip"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
-          # Exclusions usuelles
-          zip -r "$ZIP" . -x ".git/*" "node_modules/*" ".github/*"
+          # on exclut ce qui est inutile dans l’artefact
+          zip -r "$ZIP" . -x ".git/*" "node_modules/*" "*.zip"
 
       - name: Déterminer le bucket EB (CreateStorageLocation idempotent)
         id: bucket
         run: |
           BUCKET="$(aws elasticbeanstalk create-storage-location --query S3Bucket --output text)"
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
-          echo "Bucket EB: ${BUCKET}"
 
       - name: Upload vers S3
         run: |
           aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
 
-      - name: Créer/Enregistrer la version d’appli
+      - name: Créer / enregistrer la version d’appli (idempotent)
         id: appver
-        shell: bash
         run: |
-          set -euo pipefail
           LABEL="${{ steps.pack.outputs.zip }}"
+          set +e
           aws elasticbeanstalk create-application-version \
             --application-name "${APP_NAME}" \
             --version-label "$LABEL" \
-            --source-bundle S3Bucket="${{ steps.bucket.outputs.bucket }}",S3Key="${{ steps.pack.outputs.zip }}" \
-          || echo "Version déjà existante"
+            --source-bundle S3Bucket="${{ steps.bucket.outputs.bucket }}",S3Key="${{ steps.pack.outputs.zip }}"
+          rc=$?
+          set -e
+          if [[ $rc -ne 0 ]]; then
+            echo "⚠️ create-application-version a renvoyé $rc (souvent: version déjà existante), on continue."
+          fi
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
-          echo "Version: $LABEL"
 
+      # --- ATTENTE PRE-DEPLOIEMENT : l’environnement doit être Ready/Green avant update ---
       - name: Attendre READY/GREEN (pré-déploiement)
-        shell: bash
         run: |
-          set -euo pipefail
-          max=120   # ~20 min
-          for ((i=1;i<=max;i++)); do
-            OUT="$(aws elasticbeanstalk describe-environments \
-              --application-name "${APP_NAME}" \
+          DUR=$((10 * 60))   # 10 minutes max
+          STEP=10
+          EL=0
+          while (( EL < DUR )); do
+            read HEALTH STATUS <<<"$(aws elasticbeanstalk describe-environments \
               --environment-names "${ENV_NAME}" \
-              --query 'Environments[0].{Status:Status,Health:Health}' --output json)"
-            STATUS="$(echo "$OUT" | jq -r '.Status')"
-            HEALTH="$(echo "$OUT" | jq -r '.Health')"
-            echo "[$i/${max}] STATUS=${STATUS} | HEALTH=${HEALTH}"
-
+              --query 'Environments[0].[Health,Status]' --output text)"
+            echo "STATUS=${STATUS}  HEALTH=${HEALTH}"
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
-              echo "✅ Pré-déploiement OK."
+              echo "✅ ${ENV_NAME} est prêt."
               break
             fi
-
-            if [[ "$STATUS" == "Terminated" || "$STATUS" == "Terminating" ]]; then
-              echo "❌ L'environnement est '${STATUS}'. Abandon."
-              exit 1
-            fi
-
-            sleep 10
+            sleep "$STEP"
+            EL=$((EL + STEP))
           done
+          if [[ "$STATUS" != "Ready" || "$HEALTH" != "Green" ]]; then
+            echo "❌ ${ENV_NAME} pas prêt dans le temps imparti"
+            exit 1
+          fi
 
-      - name: Déployer (update-environment)
+      - name: Déployer sur l’environnement (update-environment)
         run: |
           aws elasticbeanstalk update-environment \
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
-      - name: Attendre READY/GREEN (post-déploiement)
-        shell: bash
+      # --- ATTENTE POST-DEPLOIEMENT robuste (sans timeout-minutes GitHub) ---
+      - name: Attendre que l’environnement soit GREEN
+        id: wait_green
+        continue-on-error: false
         run: |
-          set -euo pipefail
-          max=180   # ~30 min
-          for ((i=1;i<=max;i++)); do
+          # on exige 3 confirmations consécutives Ready/Green pour éviter le flapping
+          REQUIRED_OK=3
+          ok=0
+          DUR=$((25 * 60))   # 25 minutes max
+          STEP=20
+          EL=0
+          while (( EL < DUR )); do
             OUT="$(aws elasticbeanstalk describe-environments \
-              --application-name "${APP_NAME}" \
               --environment-names "${ENV_NAME}" \
-              --query 'Environments[0].{Status:Status,Health:Health}' --output json)"
-            STATUS="$(echo "$OUT" | jq -r '.Status')"
-            HEALTH="$(echo "$OUT" | jq -r '.Health')"
-            echo "[$i/${max}] STATUS=${STATUS} | HEALTH=${HEALTH}"
-
+              --query 'Environments[0].[Health,Status]' --output text)"
+            echo "RAW: $OUT"
+            HEALTH="$(awk '{print $1}' <<<"$OUT")"
+            STATUS="$(awk '{print $2}' <<<"$OUT")"
+            echo "STATUS=${STATUS}  HEALTH=${HEALTH}  (ok=${ok}/${REQUIRED_OK})"
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
-              echo "✅ Déploiement OK."
-              exit 0
+              ok=$((ok+1))
+              if (( ok >= REQUIRED_OK )); then
+                echo "✅ Environnement stable: Ready/Green"
+                exit 0
+              fi
+            else
+              ok=0
             fi
-
-            if (( i % 30 == 0 )); then
-              echo "— Derniers events EB (aperçu) —"
-              aws elasticbeanstalk describe-events \
-                --environment-name "${ENV_NAME}" \
-                --start-time "$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
-                --max-records 20 \
-                --query 'Events[].{Time:EventDate,Sev:Severity,Msg:Message}' \
-                --output table || true
-            fi
-
-            sleep 10
+            sleep "$STEP"
+            EL=$((EL + STEP))
           done
-
-          echo "❌ Timeout logique (post-déploiement)."
+          echo "❌ Timeout d’attente Ready/Green"
           exit 1
 
-      - name: Test de fumée (/health) avec retries et fallback
-        if: ${{ success() }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          CNAME="$(aws elasticbeanstalk describe-environments \
-            --environment-names "${ENV_NAME}" \
-            --query 'Environments[0].CNAME' --output text)"
-          echo "CNAME=${CNAME}"
-
-          try_url () {
-            local url="$1"
-            echo "Test ${url}"
-            for i in {1..30}; do
-              code="$(curl -sk -o /dev/null -w '%{http_code}' "$url" || true)"
-              echo "  tentative $i -> HTTP $code"
-              if [[ "$code" == "200" ]]; then
-                echo "✅ OK $url"
-                return 0
-              fi
-              sleep 5
-            done
-            return 1
-          }
-
-          try_url "https://${CNAME}${HEALTH_PATH}" || try_url "http://${CNAME}${HEALTH_PATH}"
-
-      # ——— DIAGNOSTICS TOUJOURS ———
-      - name: (Diag) Derniers événements EB (30m)
-        if: ${{ always() }}
-        continue-on-error: true
+      # DIAGNOSTICS si l’attente a échoué (events + logs EB)
+      - name: (Diag) Derniers évènements EB (si échec d’attente)
+        if: failure() && steps.wait_green.outcome == 'failure'
         run: |
           aws elasticbeanstalk describe-events \
             --environment-name "${ENV_NAME}" \
-            --start-time "$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
-            --max-records 50 \
+            --start-time "$(date -u -d '45 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
+            --max-records 200 \
             --query 'Events[].{Time:EventDate,Sev:Severity,Msg:Message}' \
-            --output table
+            --output table || true
 
-      - name: (Diag) Tail logs EB
-        if: ${{ failure() }}
-        continue-on-error: true
-        run: |
           aws elasticbeanstalk request-environment-info \
-            --environment-name "${ENV_NAME}" --info-type tail || true
+            --environment-name "${ENV_NAME}" \
+            --info-type tail || true
           sleep 20
           aws elasticbeanstalk retrieve-environment-info \
-            --environment-name "${ENV_NAME}" --info-type tail \
-            --query 'EnvironmentInfo[].{When:SampleTimestamp,URL:Message}' --output table || true
+            --environment-name "${ENV_NAME}" \
+            --info-type tail \
+            --query 'EnvironmentInfo[].{When:SampleTimestamp,URL:Message}' \
+            --output table || true
+
+      - name: Test de fumée (/health)
+        run: |
+          CNAME="$(aws elasticbeanstalk describe-environments \
+            --environment-names "${ENV_NAME}" \
+            --query 'Environments[0].CNAME' --output text)"
+          if [[ -z "$CNAME" || "$CNAME" == "None" ]]; then
+            echo "❌ CNAME introuvable"
+            exit 1
+          fi
+          URL_HTTPS="https://${CNAME}/health"
+          URL_HTTP="http://${CNAME}/health"
+          echo "Test HTTPS: $URL_HTTPS"
+          ok=0
+          for i in {1..20}; do
+            code=$(curl -sk --connect-timeout 5 --max-time 10 -o /dev/null -w "%{http_code}" "$URL_HTTPS" || true)
+            echo "Tentative $i (HTTPS) => $code"
+            if [[ "$code" == "200" ]]; then ok=1; break; fi
+            sleep $((i<10 ? 3 : 6))
+          done
+          if [[ $ok -ne 1 ]]; then
+            echo "⚠️ HTTPS pas encore OK, on tente HTTP (fallback)"
+            for i in {1..10}; do
+              code=$(curl -s --connect-timeout 5 --max-time 10 -o /dev/null -w "%{http_code}" "$URL_HTTP" || true)
+              echo "Tentative $i (HTTP) => $code"
+              if [[ "$code" == "200" ]]; then ok=1; break; fi
+              sleep 5
+            done
+          fi
+          if [[ $ok -ne 1 ]]; then
+            echo "❌ Smoke test KO"
+            exit 1
+          fi
+          echo "✅ Smoke test OK"
