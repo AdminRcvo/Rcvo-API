@@ -4,6 +4,11 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      env_name:
+        description: "Nom exact de l'environnement EB (ex: Rcvo-Backend-lb)"
+        required: false
+        default: "Rcvo-Backend-lb"
 
 permissions:
   id-token: write
@@ -16,13 +21,12 @@ concurrency:
 env:
   AWS_REGION: eu-west-3
   APP_NAME: Rcvo-backend
-  # <<< CHANGE ICI si tu veux déployer ailleurs (rcvo-backend-prod / Rcvo-Backend-env) >>>
-  ENV_NAME: Rcvo-Backend-lb
+  # ► Par défaut on déploie sur Rcvo-Backend-lb (existant et Green/Ready)
+  ENV_NAME: ${{ inputs.env_name || 'Rcvo-Backend-lb' }}
 
 jobs:
   deployer:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,7 +40,7 @@ jobs:
       - name: Vérifier l’identité AWS
         run: aws sts get-caller-identity
 
-      # ---------- Sécurité : valider que l'environnement existe ----------
+      # ======= GARDE-FOU : l'environnement doit exister =======
       - name: Vérifier que l’environnement cible existe
         id: envcheck
         shell: bash
@@ -51,7 +55,7 @@ jobs:
           echo "Lookup: $OUT"
           if [[ -z "$OUT" ]]; then
             echo "❌ Environnement '${ENV}' introuvable dans l'appli '${APP_NAME}' (region ${AWS_REGION})."
-            echo "📋 Environnements existants :"
+            echo "📋 Environnements disponibles :"
             aws elasticbeanstalk describe-environments \
               --region "${AWS_REGION}" \
               --application-name "${APP_NAME}" \
@@ -85,7 +89,7 @@ jobs:
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
           zip -r "$ZIP" . -x ".git/*" "node_modules/*"
 
-      - name: Déterminer le bucket EB (CreateStorageLocation idempotent)
+      - name: Déterminer le bucket EB (idempotent)
         id: bucket
         run: |
           BUCKET="$(aws elasticbeanstalk create-storage-location --region "${AWS_REGION}" --query S3Bucket --output text)"
@@ -94,7 +98,7 @@ jobs:
       - name: Upload vers S3
         run: aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
 
-      - name: Créer/Enregistrer la version d’appli
+      - name: Créer / enregistrer la version d’appli
         id: appver
         shell: bash
         run: |
@@ -108,13 +112,13 @@ jobs:
           || echo "Version déjà existante"
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
-      # ----------- PRÉ-DÉPLOIEMENT : attendre uniquement Status=Ready -----------
+      # ======= ATTENTE PRÉ-DÉPLOIEMENT : STATUS doit être Ready =======
       - name: Attendre READY (pré-déploiement)
         shell: bash
         run: |
           set -euo pipefail
           ENV="${ENV_NAME}"
-          MAX=120   # ~20 minutes (120 * 10s)
+          MAX=120  # ~20 min (120 * 10s)
           for i in $(seq 1 $MAX); do
             OUT="$(aws elasticbeanstalk describe-environments \
               --region "${AWS_REGION}" \
@@ -138,19 +142,19 @@ jobs:
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
-      # ----------- POST-DÉPLOIEMENT : attendre Ready + Green (parsing correct) -----------
+      # ======= ATTENTE POST-DÉPLOIEMENT : HEALTH=Green & STATUS=Ready =======
       - name: Attendre GREEN (post-déploiement)
         shell: bash
         run: |
           set -euo pipefail
           ENV="${ENV_NAME}"
-          MAX=90    # ~30 minutes (90 * 20s)
+          MAX=90  # ~30 min (90 * 20s)
           for i in $(seq 1 $MAX); do
             OUT="$(aws elasticbeanstalk describe-environments \
               --region "${AWS_REGION}" \
               --environment-names "$ENV" \
               --query 'Environments[0].[Health,Status]' --output text || true)"
-            HEALTH="$(echo "$OUT" | awk '{print $1}')"   # EB renvoie Health d'abord
+            HEALTH="$(echo "$OUT" | awk '{print $1}')"  # EB renvoie Health puis Status
             STATUS="$(echo "$OUT" | awk '{print $2}')"
             echo "HEALTH=$HEALTH  STATUS=$STATUS"
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
