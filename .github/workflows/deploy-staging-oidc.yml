@@ -1,27 +1,25 @@
-name: Déploiement STAGING (OIDC)
+name: Déploiement STAGING (OIDC → Elastic Beanstalk)
 
 on:
   push:
-    branches: [ main ]     # ← mets "staging" si tu déclenches depuis la branche staging
+    branches: [ main ]
   workflow_dispatch:
+
+concurrency:
+  group: eb-staging-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   id-token: write
   contents: read
 
-concurrency:
-  group: rcvo-staging
-  cancel-in-progress: true
-
 env:
   AWS_REGION: eu-west-3
   APP_NAME: Rcvo-backend
   ENV_NAME: Rcvo-Backend-staging
-  # si jamais tu veux renvoyer le healthcheck en HTTP temporairement, change HEALTH_SCHEME en http
-  HEALTH_SCHEME: https
 
 jobs:
-  deploy:
+  deployer:
     runs-on: ubuntu-latest
 
     steps:
@@ -37,39 +35,35 @@ jobs:
       - name: Vérifier l’identité AWS
         run: aws sts get-caller-identity
 
-      - name: Installer Node.js
+      - name: Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: 22
 
-      - name: Installer dépendances (lockfile si présent)
+      - name: Installer dépendances
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
+          if [ -f package-lock.json ]; then npm ci; else npm i; fi
 
       - name: Build (facultatif)
         run: npm run build --if-present
 
-      # Emballage léger; EB décompresse côté instance
-      - name: Créer l’archive à déployer
+      - name: Pack ZIP
         id: pack
         shell: bash
         run: |
           set -euo pipefail
-          TS="$(date +%Y%m%d_%H%M%S)"
           SHA="${GITHUB_SHA::7}"
+          TS="$(date +%Y%m%d_%H%M%S)"
           ZIP="app-${SHA}-${TS}.zip"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
-          zip -r "$ZIP" . -x ".git/*" "node_modules/*" "$ZIP"
+          zip -r "$ZIP" . -x ".git/*" "node_modules/*" "**/*.zip"
 
-      - name: Déterminer le bucket EB (idempotent)
+      - name: Bucket EB (idempotent)
         id: bucket
         run: |
+          set -euo pipefail
           BUCKET="$(aws elasticbeanstalk create-storage-location --query S3Bucket --output text)"
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
 
@@ -77,9 +71,8 @@ jobs:
         run: |
           aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
 
-      - name: Créer / enregistrer la version d’appli
+      - name: Enregistrer la version d’appli
         id: appver
-        shell: bash
         run: |
           set -euo pipefail
           LABEL="${{ steps.pack.outputs.zip }}"
@@ -87,116 +80,92 @@ jobs:
             --application-name "${APP_NAME}" \
             --version-label "$LABEL" \
             --source-bundle S3Bucket="${{ steps.bucket.outputs.bucket }}",S3Key="${{ steps.pack.outputs.zip }}" \
-          || echo "✔️ Version déjà existante"
+          || echo "Version déjà existante"
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
-      # ---- Attente PRE-DEPLOY (Ready/Green) sans timeout rigide GitHub ----
-      - name: Attendre ENV Ready/Green (pré-déploiement)
+      # ---------- Attente PRE-déploiement : Ready/Green ----------
+      - name: Attendre READY/GREEN (pré-déploiement)
         shell: bash
         run: |
           set -euo pipefail
-          MAX_SEC=$((30*60))   # 30 minutes max
-          STEP=15
-          ELAPSED=0
-          while [ $ELAPSED -lt $MAX_SEC ]; do
-            read HEALTH STATUS <<<"$(aws elasticbeanstalk describe-environments \
-              --region "${AWS_REGION}" \
-              --environment-names "${ENV_NAME}" \
-              --query 'Environments[0].[Health,Status]' \
-              --output text 2>/dev/null || true)"
-            echo "PRE  | STATUS=${STATUS:-None} HEALTH=${HEALTH:-None}  (t+${ELAPSED}s)"
+          REGION="${AWS_REGION}"
+          ENV="${ENV_NAME}"
+          deadline=$((SECONDS+1800)) # 30 min max
+          while (( SECONDS < deadline )); do
+            STATUS=$(aws elasticbeanstalk describe-environments --region "$REGION" \
+              --environment-names "$ENV" --query 'Environments[0].Status' --output text 2>/dev/null || echo None)
+            HEALTH=$(aws elasticbeanstalk describe-environments --region "$REGION" \
+              --environment-names "$ENV" --query 'Environments[0].Health' --output text 2>/dev/null || echo None)
+            echo "STATUS=$STATUS  HEALTH=$HEALTH"
             if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
-              echo "✅ ${ENV_NAME} prêt pour déploiement."
-              break
+              echo "✅ $ENV prêt (pré-déploiement)."
+              exit 0
             fi
-            sleep $STEP
-            ELAPSED=$((ELAPSED + STEP))
+            sleep 10
           done
-          if [[ "$STATUS" != "Ready" || "$HEALTH" != "Green" ]]; then
-            echo "❌ ${ENV_NAME} pas prêt après $MAX_SEC s"
-            exit 1
-          fi
+          echo "❌ $ENV pas prêt avant déploiement (30 min)."
+          aws elasticbeanstalk describe-events --region "$REGION" --environment-name "$ENV" \
+            --start-time "$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
+            --max-records 50 --query 'Events[].{Time:EventDate,Sev:Severity,Msg:Message}' --output table || true
+          exit 1
 
-      - name: Déployer sur l’environnement
+      - name: Déployer sur l’environnement (update-environment)
         run: |
           aws elasticbeanstalk update-environment \
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
-      # ---- Attente POST-DEPLOY (Ready/Green) ----
-      - name: Attendre ENV Ready/Green (post-déploiement)
+      # ---------- Attente POST-déploiement : Ready/Green ----------
+      - name: Attendre READY/GREEN (post-déploiement)
         shell: bash
         run: |
           set -euo pipefail
-          MAX_SEC=$((45*60))   # 45 minutes max (déploiement + eventuels rolling)
-          STEP=15
-          ELAPSED=0
-          while [ $ELAPSED -lt $MAX_SEC ]; do
-            read HEALTH STATUS VERSION <<<"$(aws elasticbeanstalk describe-environments \
-              --region "${AWS_REGION}" \
-              --environment-names "${ENV_NAME}" \
-              --query 'Environments[0].[Health,Status,VersionLabel]' \
-              --output text 2>/dev/null || true)"
-            echo "POST | STATUS=${STATUS:-None} HEALTH=${HEALTH:-None} VERSION=${VERSION:-None} (t+${ELAPSED}s)"
-            if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" && "$VERSION" == "${{ steps.appver.outputs.label }}" ]]; then
-              echo "✅ ${ENV_NAME} déployé et sain."
-              break
-            fi
-            sleep $STEP
-            ELAPSED=$((ELAPSED + STEP))
-          done
-          if [[ "$STATUS" != "Ready" || "$HEALTH" != "Green" || "$VERSION" != "${{ steps.appver.outputs.label }}" ]]; then
-            echo "❌ ${ENV_NAME} pas sain après $MAX_SEC s"
-            exit 1
-          fi
-
-      - name: Smoke test /health (retries avec backoff)
-        shell: bash
-        run: |
-          set -euo pipefail
-          CNAME="$(aws elasticbeanstalk describe-environments \
-            --region "${AWS_REGION}" \
-            --environment-names "${ENV_NAME}" \
-            --query 'Environments[0].CNAME' --output text)"
-          URL="${HEALTH_SCHEME}://${CNAME}/health"
-          echo "Test: $URL"
-          for i in $(seq 1 30); do
-            code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL" || true)
-            echo "Tentative $i → HTTP $code"
-            if [[ "$code" == "200" ]]; then
-              echo "✅ Smoke test OK"
+          REGION="${AWS_REGION}"
+          ENV="${ENV_NAME}"
+          deadline=$((SECONDS+2400)) # 40 min max
+          while (( SECONDS < deadline )); do
+            STATUS=$(aws elasticbeanstalk describe-environments --region "$REGION" \
+              --environment-names "$ENV" --query 'Environments[0].Status' --output text 2>/dev/null || echo None)
+            HEALTH=$(aws elasticbeanstalk describe-environments --region "$REGION" \
+              --environment-names "$ENV" --query 'Environments[0].Health' --output text 2>/dev/null || echo None)
+            echo "STATUS=$STATUS  HEALTH=$HEALTH"
+            if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
+              echo "✅ Environnement READY/GREEN."
               exit 0
             fi
-            sleep $((i*5))
+            sleep 15
           done
-          echo "❌ Smoke test KO"
+          echo "❌ Timeout post-déploiement."
+          aws elasticbeanstalk describe-events --region "$REGION" --environment-name "$ENV" \
+            --start-time "$(date -u -d '40 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
+            --max-records 100 --query 'Events[].{Time:EventDate,Sev:Severity,Msg:Message}' --output table || true
           exit 1
 
-      # ---- DIAGNOSTICS EN CAS D'ÉCHEC EN AVAL ----
-      - name: (Diag) Derniers events EB (30 min)
-        if: failure()
+      - name: Smoke test (/health) HTTP + HTTPS (retries)
         shell: bash
         run: |
-          aws elasticbeanstalk describe-events \
-            --region "${AWS_REGION}" \
-            --environment-name "${ENV_NAME}" \
-            --start-time "$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
-            --max-records 200 \
-            --query 'Events[].{Time:EventDate,Sev:Severity,Msg:Message}' \
-            --output table || true
+          set -euo pipefail
+          REGION="${AWS_REGION}"
+          ENV="${ENV_NAME}"
+          CNAME=$(aws elasticbeanstalk describe-environments --region "$REGION" \
+            --environment-names "$ENV" --query 'Environments[0].CNAME' --output text)
+          echo "CNAME=$CNAME"
+          URL_HTTPS="https://${CNAME}/health"
+          URL_HTTP="http://${CNAME}/health"
 
-      - name: (Diag) Tail des logs EB
-        if: failure()
-        shell: bash
-        run: |
-          aws elasticbeanstalk request-environment-info \
-            --region "${AWS_REGION}" \
-            --environment-name "${ENV_NAME}" \
-            --info-type tail || true
-          sleep 20
-          aws elasticbeanstalk retrieve-environment-info \
-            --region "${AWS_REGION}" \
-            --environment-name "${ENV_NAME}" \
-            --info-type tail \
-            --query 'EnvironmentInfo[].{When:SampleTimestamp,URL:Message}' \
-            --output table || true
+          # 15 tentatives, backoff simple
+          ok=0
+          for i in $(seq 1 15); do
+            code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL_HTTPS" || true)
+            echo "Try $i HTTPS -> $code"
+            if [[ "$code" == "200" ]]; then ok=1; break; fi
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL_HTTP" || true)
+            echo "Try $i HTTP  -> $code"
+            if [[ "$code" == "200" ]]; then ok=1; break; fi
+            sleep $((i*2))
+          done
+          if [[ "$ok" -ne 1 ]]; then
+            echo "❌ /health KO"
+            exit 1
+          fi
+          echo "✅ /health OK"
