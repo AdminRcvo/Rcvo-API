@@ -21,7 +21,6 @@ concurrency:
 env:
   AWS_REGION: eu-west-3
   APP_NAME: Rcvo-backend
-  # ► Par défaut on déploie sur Rcvo-Backend-lb (existant et Green/Ready)
   ENV_NAME: ${{ inputs.env_name || 'Rcvo-Backend-lb' }}
 
 jobs:
@@ -40,7 +39,7 @@ jobs:
       - name: Vérifier l’identité AWS
         run: aws sts get-caller-identity
 
-      # ======= GARDE-FOU : l'environnement doit exister =======
+      # --- GARDE-FOU : l'environnement doit exister (fail-fast) ---
       - name: Vérifier que l’environnement cible existe
         id: envcheck
         shell: bash
@@ -50,11 +49,11 @@ jobs:
           OUT="$(aws elasticbeanstalk describe-environments \
             --region "${AWS_REGION}" \
             --application-name "${APP_NAME}" \
-            --query "Environments[?EnvironmentName=='${ENV}'].{Name:EnvironmentName,Status:Status,Health:Health}" \
+            --query "Environments[?EnvironmentName=='${ENV}'].{N:EnvironmentName,S:Status,H:Health}" \
             --output text || true)"
           echo "Lookup: $OUT"
           if [[ -z "$OUT" ]]; then
-            echo "❌ Environnement '${ENV}' introuvable dans l'appli '${APP_NAME}' (region ${AWS_REGION})."
+            echo "❌ Environnement '${ENV}' introuvable dans l'application '${APP_NAME}' (${AWS_REGION})."
             echo "📋 Environnements disponibles :"
             aws elasticbeanstalk describe-environments \
               --region "${AWS_REGION}" \
@@ -98,7 +97,7 @@ jobs:
       - name: Upload vers S3
         run: aws s3 cp "${{ steps.pack.outputs.zip }}" "s3://${{ steps.bucket.outputs.bucket }}/${{ steps.pack.outputs.zip }}"
 
-      - name: Créer / enregistrer la version d’appli
+      - name: Créer/Enregistrer la version d’appli
         id: appver
         shell: bash
         run: |
@@ -112,13 +111,13 @@ jobs:
           || echo "Version déjà existante"
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
-      # ======= ATTENTE PRÉ-DÉPLOIEMENT : STATUS doit être Ready =======
+      # --- Attente PRE-déploiement : juste STATUS Ready (pas 5 min pour rien) ---
       - name: Attendre READY (pré-déploiement)
         shell: bash
         run: |
           set -euo pipefail
           ENV="${ENV_NAME}"
-          MAX=120  # ~20 min (120 * 10s)
+          MAX=60  # ~10 min (60 * 10s)
           for i in $(seq 1 $MAX); do
             OUT="$(aws elasticbeanstalk describe-environments \
               --region "${AWS_REGION}" \
@@ -133,7 +132,7 @@ jobs:
             fi
             sleep 10
           done
-          echo "❌ $ENV pas READY après ~20 min"; exit 1
+          echo "❌ $ENV pas READY après ~10 min"; exit 1
 
       - name: Déployer sur l’environnement
         run: |
@@ -142,7 +141,7 @@ jobs:
             --environment-name "${ENV_NAME}" \
             --version-label "${{ steps.appver.outputs.label }}"
 
-      # ======= ATTENTE POST-DÉPLOIEMENT : HEALTH=Green & STATUS=Ready =======
+      # --- Attente POST-déploiement : HEALTH=Green & STATUS=Ready ---
       - name: Attendre GREEN (post-déploiement)
         shell: bash
         run: |
@@ -169,11 +168,10 @@ jobs:
                 --start-time "$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
                 --max-records 50 \
                 --query 'Events[].{At:EventDate,Sev:Severity,Msg:Message}' --output table || true
-              echo "--------------------------------------"
             fi
             sleep 20
           done
-          echo "❌ Timeout attente GREEN (~30 min)."; exit 1
+          echo "❌ Timeout attente GREEN (~30 min)"; exit 1
 
       - name: Test de fumée (/health)
         shell: bash
