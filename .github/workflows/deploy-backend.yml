@@ -14,7 +14,8 @@ env:
   REGION: eu-west-3
   APP_NAME: Rcvo-backend
   ENV_STAGING: Rcvo-Backend-staging
-  ENV_PROD: Rcvo-Backend-prod
+  ENV_PROD: rcvo-backend-prod
+  # Renseigne ces deux hôtes quand tes DNS pointent vers EB (sinon laisse vide et on testera le CNAME EB avec -k)
   SMOKE_HOST_STAGING: ""
   SMOKE_HOST_PROD: ""
 
@@ -30,16 +31,18 @@ jobs:
 
       - name: Pick role/env/host by ref
         id: pick
+        shell: bash
         run: |
+          set -euo pipefail
           REF="${GITHUB_REF}"
           if [[ "$REF" == refs/heads/main || "$REF" == refs/tags/v* ]]; then
-            echo "ROLE=${ROLE_PROD}"           >> "$GITHUB_OUTPUT"
-            echo "ENV_NAME=${ENV_PROD}"        >> "$GITHUB_OUTPUT"
-            echo "SMOKE_HOST=${SMOKE_HOST_PROD}" >> "$GITHUB_OUTPUT"
+            echo "ROLE=${ROLE_PROD}"                 >> "$GITHUB_OUTPUT"
+            echo "ENV_NAME=${ENV_PROD}"              >> "$GITHUB_OUTPUT"
+            echo "SMOKE_HOST=${SMOKE_HOST_PROD}"     >> "$GITHUB_OUTPUT"
           else
-            echo "ROLE=${ROLE_STAGING}"        >> "$GITHUB_OUTPUT"
-            echo "ENV_NAME=${ENV_STAGING}"     >> "$GITHUB_OUTPUT"
-            echo "SMOKE_HOST=${SMOKE_HOST_STAGING}" >> "$GITHUB_OUTPUT"
+            echo "ROLE=${ROLE_STAGING}"              >> "$GITHUB_OUTPUT"
+            echo "ENV_NAME=${ENV_STAGING}"           >> "$GITHUB_OUTPUT"
+            echo "SMOKE_HOST=${SMOKE_HOST_STAGING}"  >> "$GITHUB_OUTPUT"
           fi
 
       - name: Configure AWS (OIDC)
@@ -49,31 +52,42 @@ jobs:
           role-to-assume: ${{ steps.pick.outputs.ROLE }}
 
       - uses: actions/setup-node@v4
-        with: { node-version: '20' }
+        with:
+          node-version: '20'
 
       - name: Install deps (if lockfile)
+        shell: bash
         run: if [ -f package-lock.json ]; then npm ci; fi
 
       - name: Build (optional)
+        shell: bash
         run: |
-          if [ -f package.json ] && jq -e '.scripts.build' package.json >/dev/null; then npm run build; else echo "skip build"; fi
+          if [ -f package.json ] && jq -e '.scripts.build' package.json >/dev/null 2>&1; then
+            npm run build
+          else
+            echo "skip build"
+          fi
 
       - name: Create archive
+        shell: bash
         run: zip -r app.zip . -x ".git/*" ".github/*" "node_modules/*"
 
       - name: EB storage bucket
         id: st
+        shell: bash
         run: |
           BUCKET=$(aws elasticbeanstalk create-storage-location --output text)
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
 
       - name: Upload to S3
+        shell: bash
         run: |
           VERSION="app-$(date +%Y%m%d-%H%M%S)"
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           aws s3 cp app.zip s3://${{ steps.st.outputs.bucket }}/$VERSION.zip
 
       - name: Create EB app version
+        shell: bash
         run: |
           aws elasticbeanstalk create-application-version \
             --application-name "${{ env.APP_NAME }}" \
@@ -81,26 +95,64 @@ jobs:
             --source-bundle S3Bucket=${{ steps.st.outputs.bucket }},S3Key=$VERSION.zip
 
       - name: Update environment
+        shell: bash
         run: |
           aws elasticbeanstalk update-environment \
             --environment-name "${{ steps.pick.outputs.ENV_NAME }}" \
             --version-label "$VERSION"
 
-      - name: Wait Ready/Green (max 15m)
+      # ---- Coup de pouce santé : force le healthcheck du Classic ELB, ouvre 80, et redémarre l'app ----
+      - name: Nudge health (ELB target + SG + restart)
+        shell: bash
         run: |
           set -euo pipefail
-          for i in {1..30}; do
-            OUT=$(aws elasticbeanstalk describe-environments --environment-names "${{ steps.pick.outputs.ENV_NAME }}")
-            STATUS=$(echo "$OUT" | jq -r '.Environments[0].Status')
-            HEALTH=$(echo "$OUT" | jq -r '.Environments[0].Health')
+          ENV="${{ steps.pick.outputs.ENV_NAME }}"
+          REGION="${{ env.REGION }}"
+
+          # 1) Nom du Classic ELB
+          LB_NAME=$(aws elasticbeanstalk describe-environment-resources --region "$REGION" \
+            --environment-name "$ENV" --query 'EnvironmentResources.LoadBalancers[0].Name' --output text)
+
+          # 2) Assure le health check sur HTTP:80/health
+          aws elb configure-health-check --region "$REGION" \
+            --load-balancer-name "$LB_NAME" \
+            --health-check Target=HTTP:80/health,Interval=15,Timeout=5,HealthyThreshold=3,UnhealthyThreshold=5
+
+          # 3) Ouvre le port 80 des instances pour le SG du LB (idempotent)
+          LB_SG=$(aws elb describe-load-balancers --region "$REGION" --load-balancer-names "$LB_NAME" \
+            --query 'LoadBalancerDescriptions[0].SecurityGroups[0]' --output text)
+          IID=$(aws elasticbeanstalk describe-environment-resources --region "$REGION" \
+            --environment-name "$ENV" --query 'EnvironmentResources.Instances[0].Id' --output text)
+          INST_SG=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text)
+          aws ec2 authorize-security-group-ingress --region "$REGION" \
+            --group-id "$INST_SG" --protocol tcp --port 80 --source-group "$LB_SG" || true
+
+          # 4) Redémarre l’app
+          aws elasticbeanstalk restart-app-server --region "$REGION" --environment-name "$ENV"
+
+      - name: Wait Ready/Green (max 20m)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENV="${{ steps.pick.outputs.ENV_NAME }}"
+          for i in {1..40}; do
+            OUT=$(aws elasticbeanstalk describe-environments --environment-names "$ENV" \
+                  --query 'Environments[0].[Status,Health]' --output text)
+            STATUS=$(awk '{print $1}' <<<"$OUT")
+            HEALTH=$(awk '{print $2}' <<<"$OUT")
             echo "STATUS=$STATUS  HEALTH=$HEALTH"
-            [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]] && exit 0
+            if [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]]; then
+              exit 0
+            fi
             sleep 30
           done
           echo "Timeout waiting Ready/Green"; exit 1
 
       - name: Smoke test (HTTPS; auto-handle cert/CNAME)
+        shell: bash
         run: |
+          set -euo pipefail
           CNAME=$(aws elasticbeanstalk describe-environments --environment-names "${{ steps.pick.outputs.ENV_NAME }}" --query 'Environments[0].CNAME' --output text)
           HOST="${{ steps.pick.outputs.SMOKE_HOST }}"
           if [ -n "$HOST" ]; then
