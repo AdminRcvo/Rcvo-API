@@ -1,0 +1,88 @@
+name: RCVO Watchdog EB (auto-fix)
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  REGION: eu-west-3
+  ROLE_STAGING: arn:aws:iam::409818814260:role/RcvoDeployStagingRole
+  ROLE_PROD:    arn:aws:iam::409818814260:role/RcvoDeployProdRole
+
+jobs:
+  check-and-fix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env_name: Rcvo-Backend-staging
+            role: arn:aws:iam::409818814260:role/RcvoDeployStagingRole
+          - env_name: rcvo-backend-prod
+            role: arn:aws:iam::409818814260:role/RcvoDeployProdRole
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurer AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.REGION }}
+          role-to-assume: ${{ matrix.role }}
+
+      - name: Lire état EB + smoke
+        id: probe
+        shell: bash
+        run: |
+          OUT=$(aws elasticbeanstalk describe-environments \
+            --region "${{ env.REGION }}" --environment-names "${{ matrix.env_name }}")
+          STATUS=$(jq -r '.Environments[0].Status' <<< "$OUT")
+          HEALTH=$(jq -r '.Environments[0].Health' <<< "$OUT")
+          CNAME=$(jq -r '.Environments[0].CNAME' <<< "$OUT")
+          CODE=$(curl -k -sS -o /dev/null -w "%{http_code}" "https://${CNAME}/health" || true)
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "health=$HEALTH" >> $GITHUB_OUTPUT
+          echo "code=$CODE"     >> $GITHUB_OUTPUT
+          echo "cname=$CNAME"   >> $GITHUB_OUTPUT
+          echo "STATUS=$STATUS HEALTH=$HEALTH CNAME=$CNAME HTTP=$CODE"
+
+      - name: Auto-fix si Red ou HTTP != 2xx/3xx
+        if: steps.probe.outputs.health != 'Green' || (steps.probe.outputs.code != '200' && steps.probe.outputs.code != '204' && steps.probe.outputs.code != '301' && steps.probe.outputs.code != '302')
+        shell: bash
+        run: |
+          set -euo pipefail
+          REGION="${{ env.REGION }}"
+          ENV="${{ matrix.env_name }}"
+
+          LB_NAME=$(aws elasticbeanstalk describe-environment-resources --region "$REGION" \
+            --environment-name "$ENV" --query 'EnvironmentResources.LoadBalancers[0].Name' --output text)
+          aws elb configure-health-check --region "$REGION" --load-balancer-name "$LB_NAME" \
+            --health-check Target=HTTP:80/health,Interval=15,Timeout=5,HealthyThreshold=3,UnhealthyThreshold=5
+
+          IID=$(aws elasticbeanstalk describe-environment-resources --region "$REGION" \
+            --environment-name "$ENV" --query 'EnvironmentResources.Instances[0].Id' --output text)
+          INST_SG=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text)
+          LB_SG=$(aws elb describe-load-balancers --region "$REGION" \
+            --load-balancer-names "$LB_NAME" \
+            --query 'LoadBalancerDescriptions[0].SecurityGroups[0]' --output text || true)
+          if [ -n "$LB_SG" ] && [ "$LB_SG" != "None" ]; then
+            aws ec2 authorize-security-group-ingress --region "$REGION" \
+              --group-id "$INST_SG" --protocol tcp --port 80 --source-group "$LB_SG" || true
+          fi
+
+          aws elasticbeanstalk restart-app-server --region "$REGION" --environment-name "$ENV"
+
+          for i in {1..10}; do
+            OUT=$(aws elasticbeanstalk describe-environments --region "$REGION" \
+                  --environment-names "$ENV" --query 'Environments[0].[Status,Health]' --output text)
+            echo "EB=$OUT"
+            [[ "$OUT" == "Ready    Green" || "$OUT" == $'Ready\tGreen' ]] && exit 0
+            sleep 30
+          done
+          echo "Encore pas Green (signalé dans les logs)."
