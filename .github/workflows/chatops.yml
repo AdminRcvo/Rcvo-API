@@ -1,0 +1,100 @@
+name: RCVO ChatOps
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+env:
+  REGION: eu-west-3
+  ROLE_STAGING: arn:aws:iam::409818814260:role/RcvoDeployStagingRole
+  ROLE_PROD:    arn:aws:iam::409818814260:role/RcvoDeployProdRole
+  ENV_STAGING:  Rcvo-Backend-staging
+  ENV_PROD:     rcvo-backend-prod
+
+jobs:
+  route:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Décider l'action
+        id: decide
+        shell: bash
+        run: |
+          BODY="${{ github.event.comment.body }}"
+          echo "BODY=$BODY"
+          # commandes supportées :
+          # /fix-health staging | /fix-health prod
+          # /deploy staging | /deploy prod
+          if [[ "$BODY" =~ ^/fix-health[[:space:]]+staging$ ]]; then
+            echo "cmd=fix"   >> $GITHUB_OUTPUT
+            echo "env=$ENV_STAGING" >> $GITHUB_OUTPUT
+            echo "role=$ROLE_STAGING" >> $GITHUB_OUTPUT
+          elif [[ "$BODY" =~ ^/fix-health[[:space:]]+prod$ ]]; then
+            echo "cmd=fix"   >> $GITHUB_OUTPUT
+            echo "env=$ENV_PROD" >> $GITHUB_OUTPUT
+            echo "role=$ROLE_PROD" >> $GITHUB_OUTPUT
+          elif [[ "$BODY" =~ ^/deploy[[:space:]]+staging$ ]]; then
+            echo "cmd=deploy" >> $GITHUB_OUTPUT
+            echo "env=$ENV_STAGING" >> $GITHUB_OUTPUT
+            echo "role=$ROLE_STAGING" >> $GITHUB_OUTPUT
+          elif [[ "$BODY" =~ ^/deploy[[:space:]]+prod$ ]]; then
+            echo "cmd=deploy" >> $GITHUB_OUTPUT
+            echo "env=$ENV_PROD" >> $GITHUB_OUTPUT
+            echo "role=$ROLE_PROD" >> $GITHUB_OUTPUT
+          else
+            echo "Aucune commande reconnue."
+            exit 0
+          fi
+
+      - name: Configure AWS (OIDC)
+        if: steps.decide.outputs.cmd
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.REGION }}
+          role-to-assume: ${{ steps.decide.outputs.role }}
+
+      - name: Fix health
+        if: steps.decide.outputs.cmd == 'fix'
+        shell: bash
+        run: |
+          set -euo pipefail
+          REGION="${{ env.REGION }}"
+          ENV="${{ steps.decide.outputs.env }}"
+          LB_NAME=$(aws elasticbeanstalk describe-environment-resources --region "$REGION" \
+            --environment-name "$ENV" --query 'EnvironmentResources.LoadBalancers[0].Name' --output text)
+          aws elb configure-health-check --region "$REGION" --load-balancer-name "$LB_NAME" \
+            --health-check Target=HTTP:80/health,Interval=15,Timeout=5,HealthyThreshold=3,UnhealthyThreshold=5
+          IID=$(aws elasticbeanstalk describe-environment-resources --region "$REGION" \
+            --environment-name "$ENV" --query 'EnvironmentResources.Instances[0].Id' --output text)
+          INST_SG=$(aws ec2 describe-instances --region "$REGION" --instance-ids "$IID" \
+            --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text)
+          LB_SG=$(aws elb describe-load-balancers --region "$REGION" --load-balancer-names "$LB_NAME" \
+            --query 'LoadBalancerDescriptions[0].SecurityGroups[0]' --output text || true)
+          if [ -n "$LB_SG" ] && [ "$LB_SG" != "None" ]; then
+            aws ec2 authorize-security-group-ingress --region "$REGION" \
+              --group-id "$INST_SG" --protocol tcp --port 80 --source-group "$LB_SG" || true
+          fi
+          aws elasticbeanstalk restart-app-server --region "$REGION" --environment-name "$ENV"
+
+      - name: Deploy (recrée une app version à partir du repo)
+        if: steps.decide.outputs.cmd == 'deploy'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENV="${{ steps.decide.outputs.env }}"
+          REGION="${{ env.REGION }}"
+          # Archive minimaliste du repo courant (code GitHub) – même logique que ton deploy-backend.yml
+          zip -r app.zip . -x ".git/*" ".github/*" "node_modules/*"
+          BUCKET=$(aws elasticbeanstalk create-storage-location --output text)
+          VERSION="chatops-$(date +%Y%m%d-%H%M%S)"
+          aws s3 cp app.zip s3://$BUCKET/$VERSION.zip
+          aws elasticbeanstalk create-application-version \
+            --application-name "Rcvo-backend" \
+            --version-label "$VERSION" \
+            --source-bundle S3Bucket=$BUCKET,S3Key=$VERSION.zip
+          aws elasticbeanstalk update-environment \
+            --environment-name "$ENV" --version-label "$VERSION"
