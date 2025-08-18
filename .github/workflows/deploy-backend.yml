@@ -15,10 +15,23 @@ env:
   APP_NAME: Rcvo-backend
   ENV_STAGING: Rcvo-Backend-staging
   ENV_PROD: Rcvo-Backend-prod
-  # Renseigne (optionnel) tes vrais hosts si tu veux éviter -k pendant le smoke test
-  SMOKE_HOST_STAGING: ""   # ex: api-transition.rcvo.fr
-  SMOKE_HOST_PROD: ""      # ex: api.rcvo.fr
+  SMOKE_HOST_STAGING: ""
+  SMOKE_HOST_PROD: ""
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      ROLE_STAGING: arn:aws:iam::409818814260:role/RcvoDeployStagingRole
+      ROLE_PROD:    arn:aws:iam::409818814260:role/RcvoDeployProdRole
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick role/env/host by ref
+        id: pick
+        run: |
+          REF="${GITHUB_REF}"
+          if [[ "$REF" == refs/heads/main || "$REF" == refs/tags/v* ]]; then
+            echo "ROLE=${ROLE_PROD}"           >> "$GITHUB_OUTPUT"
+            echo "ENV_NAME=${ENV_PROD}"
