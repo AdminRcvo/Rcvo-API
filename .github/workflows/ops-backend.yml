@@ -1,90 +1,69 @@
-name: Ops Backend (slash-commands)
+name: Ops Backend (OIDC)
 
 on:
-  issue_comment:
-    types: [created]
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "target environment"
+        required: true
+        default: "staging"
+        type: choice
+        options: [staging, prod]
+      action:
+        description: "operation to perform"
+        required: true
+        default: "fix-health"
+        type: choice
+        options: [fix-health, restart]
 
 permissions:
   id-token: write
   contents: read
-  issues: write
 
 env:
   REGION: eu-west-3
-  APP_NAME: Rcvo-backend
   ENV_STAGING: Rcvo-Backend-staging
-  ENV_PROD: Rcvo-Backend-prod
-  ALLOWED: "AdminRcvo"  # ajoute d'autres users séparés par des virgules si besoin
+  ENV_PROD: rcvo-backend-prod
 
 jobs:
-  ops:
-    if: ${{ startsWith(github.event.comment.body, '/deploy ') || startsWith(github.event.comment.body, '/status ') }}
+  run:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Check actor is allowed
+      - name: Pick role/env
+        id: pick
         run: |
-          ACTOR="${{ github.actor }}"
-          IFS=',' read -ra USERS <<< "${ALLOWED}"
-          OK=0; for U in "${USERS[@]}"; do [ "$U" = "$ACTOR" ] && OK=1; done
-          [ $OK -eq 1 ] || { echo "User $ACTOR not allowed. Allowed: ${ALLOWED}"; exit 1; }
-
-      - name: Parse command
-        id: parse
-        run: |
-          BODY="${{ github.event.comment.body }}"
-          CMD=$(echo "$BODY" | awk '{print $1}')
-          ARG1=$(echo "$BODY" | awk '{print $2}')
-          if [ "$ARG1" = "prod" ]; then
+          if [ "${{ inputs.env }}" = "prod" ]; then
             echo "ROLE=arn:aws:iam::409818814260:role/RcvoDeployProdRole" >> $GITHUB_OUTPUT
             echo "ENV_NAME=${ENV_PROD}" >> $GITHUB_OUTPUT
           else
             echo "ROLE=arn:aws:iam::409818814260:role/RcvoDeployStagingRole" >> $GITHUB_OUTPUT
             echo "ENV_NAME=${ENV_STAGING}" >> $GITHUB_OUTPUT
           fi
-          echo "CMD=$CMD" >> $GITHUB_OUTPUT
 
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-region: ${{ env.REGION }}
-          role-to-assume: ${{ steps.parse.outputs.ROLE }}
+          role-to-assume: ${{ steps.pick.outputs.ROLE }}
 
-      - uses: actions/checkout@v4
+      - name: Restart app servers (if action==restart)
+        if: ${{ inputs.action == 'restart' }}
+        run: aws elasticbeanstalk restart-app-server --region $REGION --environment-name "${{ steps.pick.outputs.ENV_NAME }}"
 
-      - name: /status <staging|prod>
-        if: ${{ steps.parse.outputs.CMD == '/status' }}
-        run: |
-          aws elasticbeanstalk describe-environments \
-            --environment-names "${{ steps.parse.outputs.ENV_NAME }}" \
-            --query 'Environments[0].[Status,Health,CNAME]' --output table
-
-      - name: /deploy <staging|prod>
-        if: ${{ steps.parse.outputs.CMD == '/deploy' }}
+      - name: Fix health (ELB target + SG + restart)
+        if: ${{ inputs.action == 'fix-health' }}
         run: |
           set -euo pipefail
-          if [ -f package-lock.json ]; then npm ci; fi
-          if [ -f package.json ] && jq -e '.scripts.build' package.json >/dev/null; then npm run build; fi
-          zip -r app.zip . -x ".git/*" ".github/*" "node_modules/*"
-          BUCKET=$(aws elasticbeanstalk create-storage-location --output text)
-          VERSION="ops-$(date +%Y%m%d-%H%M%S)"
-          aws s3 cp app.zip s3://$BUCKET/$VERSION.zip
-          aws elasticbeanstalk create-application-version \
-            --application-name "${APP_NAME}" \
-            --version-label "$VERSION" \
-            --source-bundle S3Bucket=$BUCKET,S3Key=$VERSION.zip
-          aws elasticbeanstalk update-environment \
-            --environment-name "${{ steps.parse.outputs.ENV_NAME }}" \
-            --version-label "$VERSION"
-          for i in {1..30}; do
-            OUT=$(aws elasticbeanstalk describe-environments --environment-names "${{ steps.parse.outputs.ENV_NAME }}")
-            STATUS=$(echo "$OUT" | jq -r '.Environments[0].Status')
-            HEALTH=$(echo "$OUT" | jq -r '.Environments[0].Health')
-            echo "STATUS=$STATUS HEALTH=$HEALTH"
-            [ "$STATUS" = "Ready" ] && [ "$HEALTH" = "Green" ] && break
-            sleep 30
-          done
-          CNAME=$(aws elasticbeanstalk describe-environments --environment-names "${{ steps.parse.outputs.ENV_NAME }}" --query 'Environments[0].CNAME' --output text)
-          curl -k -sS -o /dev/null -w "%{http_code}\n" "https://${CNAME}/health" | tee /tmp/code.txt
-          CODE=$(cat /tmp/code.txt)
-          [ "$CODE" -ge 200 ] && [ "$CODE" -le 308 ]
+          ENV="${{ steps.pick.outputs.ENV_NAME }}"
+          LB_NAME=$(aws elasticbeanstalk describe-environment-resources --region $REGION --environment-name "$ENV" --query 'EnvironmentResources.LoadBalancers[0].Name' --output text)
+          LB_SG=$(aws elb describe-load-balancers --region $REGION --load-balancer-names "$LB_NAME" --query 'LoadBalancerDescriptions[0].SecurityGroups[0]' --output text || echo "")
+          IID=$(aws elasticbeanstalk describe-environment-resources --region $REGION --environment-name "$ENV" --query 'EnvironmentResources.Instances[0].Id' --output text || echo "")
+          if [ -n "$IID" ]; then
+            INST_SG=$(aws ec2 describe-instances --region $REGION --instance-ids "$IID" --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text)
+            if [ -n "$LB_SG" ]; then
+              aws ec2 authorize-security-group-ingress --region $REGION --group-id "$INST_SG" --protocol tcp --port 80 --source-group "$LB_SG" || true
+            fi
+          fi
+          aws elb configure-health-check --region $REGION --load-balancer-name "$LB_NAME" \
+            --health-check Target=HTTP:80/health,Interval=15,Timeout=5,HealthyThreshold=3,UnhealthyThreshold=5 || true
+          aws elasticbeanstalk restart-app-server --region $REGION --environment-name "$ENV"
