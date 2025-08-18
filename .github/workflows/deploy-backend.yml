@@ -53,7 +53,7 @@ jobs:
 
       - name: Build (optional)
         run: |
-          if [ -f package.json ] && jq -e '.scripts.build' package.json >/dev/null; then npm run build; else echo skip; fi
+          if [ -f package.json ] && jq -e '.scripts.build' package.json >/dev/null; then npm run build; else echo "skip build"; fi
 
       - name: Create archive
         run: zip -r app.zip . -x ".git/*" ".github/*" "node_modules/*"
@@ -85,11 +85,12 @@ jobs:
 
       - name: Wait Ready/Green (max 15m)
         run: |
+          set -euo pipefail
           for i in {1..30}; do
             OUT=$(aws elasticbeanstalk describe-environments --environment-names "${{ steps.pick.outputs.ENV_NAME }}")
             STATUS=$(echo "$OUT" | jq -r '.Environments[0].Status')
             HEALTH=$(echo "$OUT" | jq -r '.Environments[0].Health')
-            echo "Status=$STATUS Health=$HEALTH"
+            echo "STATUS=$STATUS  HEALTH=$HEALTH"
             [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]] && exit 0
             sleep 30
           done
@@ -98,7 +99,7 @@ jobs:
       - name: Smoke test (HTTPS)
         run: |
           CNAME=$(aws elasticbeanstalk describe-environments --environment-names "${{ steps.pick.outputs.ENV_NAME }}" --query 'Environments[0].CNAME' --output text)
-          URL="https://${CNAME}"
+          URL="https://${CNAME}/health"
           echo "Testing $URL"
           for i in {1..10}; do
             CODE=$(curl -sS -o /dev/null -w "%{http_code}" --location --retry 5 --retry-delay 2 --connect-timeout 10 --max-time 20 "$URL")
@@ -107,4 +108,3 @@ jobs:
             sleep 6
           done
           exit 1
-
