@@ -31,11 +31,11 @@ jobs:
         run: |
           REF="${GITHUB_REF}"
           if [[ "$REF" == refs/heads/main || "$REF" == refs/tags/v* ]]; then
-            echo "ROLE=$ROLE_PROD"      >> $GITHUB_OUTPUT
-            echo "ENV_NAME=$ENV_PROD"   >> $GITHUB_OUTPUT
+            echo "ROLE=$ROLE_PROD"      >> "$GITHUB_OUTPUT"
+            echo "ENV_NAME=$ENV_PROD"   >> "$GITHUB_OUTPUT"
           else
-            echo "ROLE=$ROLE_STAGING"   >> $GITHUB_OUTPUT
-            echo "ENV_NAME=$ENV_STAGING">> $GITHUB_OUTPUT
+            echo "ROLE=$ROLE_STAGING"   >> "$GITHUB_OUTPUT"
+            echo "ENV_NAME=$ENV_STAGING">> "$GITHUB_OUTPUT"
           fi
 
       - name: Configure AWS (OIDC)
@@ -60,7 +60,9 @@ jobs:
 
       - name: EB storage bucket
         id: st
-        run: echo "bucket=$(aws elasticbeanstalk create-storage-location --output text)" >> $GITHUB_OUTPUT
+        run: |
+          BUCKET=$(aws elasticbeanstalk create-storage-location --output text)
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
 
       - name: Upload to S3
         run: |
