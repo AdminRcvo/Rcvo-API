@@ -1,0 +1,69 @@
+name: Ops Backend (OIDC)
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "target environment"
+        required: true
+        default: "staging"
+        type: choice
+        options: [staging, prod]
+      action:
+        description: "operation to perform"
+        required: true
+        default: "fix-health"
+        type: choice
+        options: [fix-health, restart]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  REGION: eu-west-3
+  ENV_STAGING: Rcvo-Backend-staging
+  ENV_PROD: rcvo-backend-prod
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pick role/env
+        id: pick
+        run: |
+          if [ "${{ inputs.env }}" = "prod" ]; then
+            echo "ROLE=arn:aws:iam::409818814260:role/RcvoDeployProdRole" >> $GITHUB_OUTPUT
+            echo "ENV_NAME=${ENV_PROD}" >> $GITHUB_OUTPUT
+          else
+            echo "ROLE=arn:aws:iam::409818814260:role/RcvoDeployStagingRole" >> $GITHUB_OUTPUT
+            echo "ENV_NAME=${ENV_STAGING}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.REGION }}
+          role-to-assume: ${{ steps.pick.outputs.ROLE }}
+
+      - name: Restart app servers (if action==restart)
+        if: ${{ inputs.action == 'restart' }}
+        run: aws elasticbeanstalk restart-app-server --region $REGION --environment-name "${{ steps.pick.outputs.ENV_NAME }}"
+
+      - name: Fix health (ELB target + SG + restart)
+        if: ${{ inputs.action == 'fix-health' }}
+        run: |
+          set -euo pipefail
+          ENV="${{ steps.pick.outputs.ENV_NAME }}"
+          LB_NAME=$(aws elasticbeanstalk describe-environment-resources --region $REGION --environment-name "$ENV" --query 'EnvironmentResources.LoadBalancers[0].Name' --output text)
+          LB_SG=$(aws elb describe-load-balancers --region $REGION --load-balancer-names "$LB_NAME" --query 'LoadBalancerDescriptions[0].SecurityGroups[0]' --output text || echo "")
+          IID=$(aws elasticbeanstalk describe-environment-resources --region $REGION --environment-name "$ENV" --query 'EnvironmentResources.Instances[0].Id' --output text || echo "")
+          if [ -n "$IID" ]; then
+            INST_SG=$(aws ec2 describe-instances --region $REGION --instance-ids "$IID" --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text)
+            if [ -n "$LB_SG" ]; then
+              aws ec2 authorize-security-group-ingress --region $REGION --group-id "$INST_SG" --protocol tcp --port 80 --source-group "$LB_SG" || true
+            fi
+          fi
+          aws elb configure-health-check --region $REGION --load-balancer-name "$LB_NAME" \
+            --health-check Target=HTTP:80/health,Interval=15,Timeout=5,HealthyThreshold=3,UnhealthyThreshold=5 || true
+          aws elasticbeanstalk restart-app-server --region $REGION --environment-name "$ENV"
