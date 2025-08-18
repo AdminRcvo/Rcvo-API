@@ -1,3 +1,13 @@
+# (CTRL+O Entrée, puis CTRL+X pour quitter)
+
+# 4) Ajouter le fichier au commit
+git add .github/workflows/deploy-backend.yml
+
+# 5) Commit
+git commit -m "Fix EB storage bucket handling in deploy workflow"
+
+# 6) Push vers la branche staging
+git push -u origin staging
 name: Deploy Backend (OIDC)
 
 on:
@@ -58,11 +68,21 @@ jobs:
       - name: Create archive
         run: zip -r app.zip . -x ".git/*" ".github/*" "node_modules/*"
 
-      - name: EB storage bucket
+            - name: EB storage bucket
         id: st
         run: |
           BUCKET=$(aws elasticbeanstalk create-storage-location --output text)
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+<<<<<<< HEAD
+=======
+
+      - name: Upload to S3
+        run: |
+          VERSION="app-$(date +%Y%m%d-%H%M%S)"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          aws s3 cp app.zip s3://${{ steps.st.outputs.bucket }}/$VERSION.zip
+
+>>>>>>> 631f44d (Fix EB storage bucket handling in deploy workflow)
 
       - name: Upload to S3
         run: |
