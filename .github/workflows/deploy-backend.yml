@@ -3,7 +3,7 @@ name: Deploy Backend (OIDC)
 on:
   push:
     branches: [ main, staging, dev ]
-    tags:     [ 'v*' ]
+    tags: [ 'v*' ]
   workflow_dispatch:
 
 permissions:
@@ -15,6 +15,9 @@ env:
   APP_NAME: Rcvo-backend
   ENV_STAGING: Rcvo-Backend-staging
   ENV_PROD: Rcvo-Backend-prod
+  # Facultatif : mets ici tes vrais domaines si tu en as (sinon laisse vide)
+  SMOKE_HOST_STAGING: ""   # ex: api-transition.rcvo.fr
+  SMOKE_HOST_PROD: ""      # ex: api.rcvo.fr
 
 jobs:
   deploy:
@@ -26,16 +29,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Pick role/env by ref
+      - name: Pick role/env/host by ref
         id: pick
         run: |
           REF="${GITHUB_REF}"
           if [[ "$REF" == refs/heads/main || "$REF" == refs/tags/v* ]]; then
-            echo "ROLE=${ROLE_PROD}"       >> "$GITHUB_OUTPUT"
-            echo "ENV_NAME=${ENV_PROD}"    >> "$GITHUB_OUTPUT"
+            echo "ROLE=${ROLE_PROD}"           >> "$GITHUB_OUTPUT"
+            echo "ENV_NAME=${ENV_PROD}"        >> "$GITHUB_OUTPUT"
+            echo "SMOKE_HOST=${SMOKE_HOST_PROD}" >> "$GITHUB_OUTPUT"
           else
-            echo "ROLE=${ROLE_STAGING}"    >> "$GITHUB_OUTPUT"
-            echo "ENV_NAME=${ENV_STAGING}" >> "$GITHUB_OUTPUT"
+            echo "ROLE=${ROLE_STAGING}"        >> "$GITHUB_OUTPUT"
+            echo "ENV_NAME=${ENV_STAGING}"     >> "$GITHUB_OUTPUT"
+            echo "SMOKE_HOST=${SMOKE_HOST_STAGING}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Configure AWS (OIDC)
@@ -45,8 +50,7 @@ jobs:
           role-to-assume: ${{ steps.pick.outputs.ROLE }}
 
       - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+        with: { node-version: '20' }
 
       - name: Install deps (if lockfile)
         run: if [ -f package-lock.json ]; then npm ci; fi
@@ -96,13 +100,19 @@ jobs:
           done
           echo "Timeout waiting Ready/Green"; exit 1
 
-      - name: Smoke test (HTTPS)
+      - name: Smoke test (HTTPS; auto-handle cert/CNAME)
         run: |
           CNAME=$(aws elasticbeanstalk describe-environments --environment-names "${{ steps.pick.outputs.ENV_NAME }}" --query 'Environments[0].CNAME' --output text)
-          URL="https://${CNAME}/health"
+          HOST="${{ steps.pick.outputs.SMOKE_HOST }}"
+          if [ -n "$HOST" ]; then
+            URL="https://${HOST}/health"; INSECURE=""
+          else
+            URL="https://${CNAME}/health"; INSECURE="-k"   # cert mismatch toléré si on utilise le CNAME EB
+          fi
           echo "Testing $URL"
           for i in {1..10}; do
-            CODE=$(curl -sS -o /dev/null -w "%{http_code}" --location --retry 5 --retry-delay 2 --connect-timeout 10 --max-time 20 "$URL")
+            CODE=$(curl $INSECURE -sS -o /dev/null -w "%{http_code}" \
+              --location --retry 5 --retry-delay 2 --connect-timeout 10 --max-time 20 "$URL")
             echo "HTTP $CODE"
             [[ $CODE -ge 200 && $CODE -le 308 ]] && exit 0
             sleep 6
