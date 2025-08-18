@@ -15,106 +15,10 @@ env:
   APP_NAME: Rcvo-backend
   ENV_STAGING: Rcvo-Backend-staging
   ENV_PROD: Rcvo-Backend-prod
-  # Facultatif : mets ici tes vrais domaines si tu en as (sinon laisse vide)
+  # Renseigne (optionnel) tes vrais hosts si tu veux éviter -k pendant le smoke test
   SMOKE_HOST_STAGING: ""   # ex: api-transition.rcvo.fr
   SMOKE_HOST_PROD: ""      # ex: api.rcvo.fr
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    env:
-      ROLE_STAGING: arn:aws:iam::409818814260:role/RcvoDeployStagingRole
-      ROLE_PROD:    arn:aws:iam::409818814260:role/RcvoDeployProdRole
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Pick role/env/host by ref
-        id: pick
-        run: |
-          REF="${GITHUB_REF}"
-          if [[ "$REF" == refs/heads/main || "$REF" == refs/tags/v* ]]; then
-            echo "ROLE=${ROLE_PROD}"           >> "$GITHUB_OUTPUT"
-            echo "ENV_NAME=${ENV_PROD}"        >> "$GITHUB_OUTPUT"
-            echo "SMOKE_HOST=${SMOKE_HOST_PROD}" >> "$GITHUB_OUTPUT"
-          else
-            echo "ROLE=${ROLE_STAGING}"        >> "$GITHUB_OUTPUT"
-            echo "ENV_NAME=${ENV_STAGING}"     >> "$GITHUB_OUTPUT"
-            echo "SMOKE_HOST=${SMOKE_HOST_STAGING}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Configure AWS (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: ${{ env.REGION }}
-          role-to-assume: ${{ steps.pick.outputs.ROLE }}
-
-      - uses: actions/setup-node@v4
-        with: { node-version: '20' }
-
-      - name: Install deps (if lockfile)
-        run: if [ -f package-lock.json ]; then npm ci; fi
-
-      - name: Build (optional)
-        run: |
-          if [ -f package.json ] && jq -e '.scripts.build' package.json >/dev/null; then npm run build; else echo "skip build"; fi
-
-      - name: Create archive
-        run: zip -r app.zip . -x ".git/*" ".github/*" "node_modules/*"
-
-      - name: EB storage bucket
-        id: st
-        run: |
-          BUCKET=$(aws elasticbeanstalk create-storage-location --output text)
-          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
-
-      - name: Upload to S3
-        run: |
-          VERSION="app-$(date +%Y%m%d-%H%M%S)"
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          aws s3 cp app.zip s3://${{ steps.st.outputs.bucket }}/$VERSION.zip
-
-      - name: Create EB app version
-        run: |
-          aws elasticbeanstalk create-application-version \
-            --application-name "${{ env.APP_NAME }}" \
-            --version-label "$VERSION" \
-            --source-bundle S3Bucket=${{ steps.st.outputs.bucket }},S3Key=$VERSION.zip
-
-      - name: Update environment
-        run: |
-          aws elasticbeanstalk update-environment \
-            --environment-name "${{ steps.pick.outputs.ENV_NAME }}" \
-            --version-label "$VERSION"
-
-      - name: Wait Ready/Green (max 15m)
-        run: |
-          set -euo pipefail
-          for i in {1..30}; do
-            OUT=$(aws elasticbeanstalk describe-environments --environment-names "${{ steps.pick.outputs.ENV_NAME }}")
-            STATUS=$(echo "$OUT" | jq -r '.Environments[0].Status')
-            HEALTH=$(echo "$OUT" | jq -r '.Environments[0].Health')
-            echo "STATUS=$STATUS  HEALTH=$HEALTH"
-            [[ "$STATUS" == "Ready" && "$HEALTH" == "Green" ]] && exit 0
-            sleep 30
-          done
-          echo "Timeout waiting Ready/Green"; exit 1
-
-      - name: Smoke test (HTTPS; auto-handle cert/CNAME)
-        run: |
-          CNAME=$(aws elasticbeanstalk describe-environments --environment-names "${{ steps.pick.outputs.ENV_NAME }}" --query 'Environments[0].CNAME' --output text)
-          HOST="${{ steps.pick.outputs.SMOKE_HOST }}"
-          if [ -n "$HOST" ]; then
-            URL="https://${HOST}/health"; INSECURE=""
-          else
-            URL="https://${CNAME}/health"; INSECURE="-k"   # cert mismatch toléré si on utilise le CNAME EB
-          fi
-          echo "Testing $URL"
-          for i in {1..10}; do
-            CODE=$(curl $INSECURE -sS -o /dev/null -w "%{http_code}" \
-              --location --retry 5 --retry-delay 2 --connect-timeout 10 --max-time 20 "$URL")
-            echo "HTTP $CODE"
-            [[ $CODE -ge 200 && $CODE -le 308 ]] && exit 0
-            sleep 6
-          done
-          exit 1
