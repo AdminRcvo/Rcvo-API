@@ -1,0 +1,72 @@
+name: RCVO API Deploy (EB via OIDC)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  deploy-api:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      EB_APP: Rcvo-backend
+      EB_ENV: Rcvo-Backend-env
+      AWS_REGION_FALLBACK: eu-west-3
+      S3_BUCKET: rcvo-eb-artifacts
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve OIDC role
+        env:
+          A: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          B: ${{ secrets.AWS_ROLE_PROD }}
+          C: ${{ secrets.ASSISTANT_ROLE_ARN }}
+        run: |
+          ROLE="${A:-${B:-${C:-}}}"
+          if [ -z "$ROLE" ]; then
+            echo "❌ Ajoute un secret de rôle: AWS_ROLE_TO_ASSUME ou AWS_ROLE_PROD ou ASSISTANT_ROLE_ARN"
+            exit 1
+          fi
+          echo "ROLE_TO_ASSUME=$ROLE" >> $GITHUB_ENV
+
+      - name: Resolve region
+        env:
+          R: ${{ secrets.AWS_REGION }}
+        run: |
+          echo "REGION=${R:-$AWS_REGION_FALLBACK}" >> $GITHUB_ENV
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_TO_ASSUME }}
+          aws-region: ${{ env.REGION }}
+
+      - name: Zip API
+        run: |
+          APP="rcvo-api-${GITHUB_RUN_ID}"
+          zip -r "${APP}.zip" .
+          echo "APP=${APP}" >> $GITHUB_ENV
+
+      - name: Upload & Create EB version
+        run: |
+          aws s3 cp "${APP}.zip" "s3://${{ env.S3_BUCKET }}/api/${APP}.zip"
+          aws elasticbeanstalk create-application-version \
+            --application-name "${{ env.EB_APP }}" \
+            --version-label "${APP}" \
+            --source-bundle S3Bucket="${{ env.S3_BUCKET }}",S3Key="api/${APP}.zip"
+
+      - name: Update EB environment
+        run: |
+          aws elasticbeanstalk update-environment \
+            --environment-name "${{ env.EB_ENV }}" \
+            --version-label "${APP}"
+
+      - name: Quick checks
+        run: |
+          API_LB=$(aws elasticbeanstalk describe-environments --environment-names "${{ env.EB_ENV }}" --query 'Environments[0].EndpointURL' --output text)
+          echo "API LB: $API_LB"
+          curl -sI "http://${API_LB}/health" | head -n1 || true
