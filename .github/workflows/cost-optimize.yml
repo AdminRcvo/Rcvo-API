@@ -1,0 +1,92 @@
+name: Cost Optimization (manual only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tf_dir:
+        description: 'Chemin du code Terraform (ex: backend/terraform/modules/cost-optimizer)'
+        required: false
+        default: 'backend/terraform/modules/cost-optimizer'
+      private_subnet_id:
+        description: 'ID du subnet privé (si requis par le module)'
+        required: false
+        default: ''
+      aws_region:
+        description: 'Région AWS'
+        required: false
+        default: 'eu-west-3'
+      apply:
+        description: 'Mettre true pour appliquer (danger : modifie infra). Par défaut false (plan uniquement).'
+        required: false
+        default: 'false'
+
+jobs:
+  cost-optimize:
+    name: Cost Optimization
+    runs-on: ubuntu-latest
+    env:
+      TF_INPUT: "false"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Debug - show working directory & list tf_dir
+        run: |
+          echo "WORKDIR: $PWD"
+          echo "TF dir (input): ${{ inputs.tf_dir }}"
+          if [ -d "${{ inputs.tf_dir }}" ]; then
+            echo "Liste du répertoire ${ { inputs.tf_dir } }:"
+            ls -la "${{ inputs.tf_dir }}"
+          else
+            echo "Répertoire '${{ inputs.tf_dir }}' absent dans le checkout."
+          fi
+
+      - name: Fail early if module requires private_subnet_id but none provided
+        if: ${{ inputs.private_subnet_id == '' }}
+        run: |
+          # Si ton module réclame la variable private_subnet_id il faut la fournir.
+          # On ne force pas l'erreur ici par défaut : décommenter la ligne suivante pour exiger la variable.
+          # echo "Le paramètre 'private_subnet_id' est vide. Renseignez-le pour exécuter le plan." && exit 1
+          echo "private_subnet_id non renseigné — si ton module en a besoin, passe-le dans les inputs."
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+
+      - name: Terraform Init & Plan
+        working-directory: ${{ inputs.tf_dir }}
+        run: |
+          terraform init -input=false
+          # On passe la variable private_subnet_id si fournie (sinon on n'envoie rien)
+          if [ -n "${{ inputs.private_subnet_id }}" ]; then
+            terraform plan -input=false -var "private_subnet_id=${{ inputs.private_subnet_id }}" -out=tfplan
+          else
+            terraform plan -input=false -out=tfplan
+          fi
+
+      - name: Save plan artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: ${{ inputs.tf_dir }}/tfplan
+
+      - name: Terraform Apply (only if requested)
+        if: ${{ inputs.apply == 'true' }}
+        working-directory: ${{ inputs.tf_dir }}
+        run: |
+          terraform apply -input=false -auto-approve tfplan
+
+      - name: Notify summary
+        run: |
+          echo "Cost optimize job completed. apply=${{ inputs.apply }}; tf_dir=${{ inputs.tf_dir }}"
