@@ -27,7 +27,7 @@ app.post('/api/admin/register', async (req, res) => {
     const admin  = await addAdmin(email, hashed);
 
     const confirmToken = jwt.sign({ sub: admin.id }, process.env.JWT_SECRET, { expiresIn: '24h' });
-    const confirmUrl   = \`https://\${req.headers.host}/confirm.html?token=\${confirmToken}\`;
+    const confirmUrl   = `https://${req.headers.host}/confirm.html?token=${confirmToken}`;
 
     const ses = new AWS.SES({ region: process.env.AWS_REGION });
     await ses.sendEmail({
@@ -35,7 +35,7 @@ app.post('/api/admin/register', async (req, res) => {
       Destination: { ToAddresses: [email] },
       Message: {
         Subject: { Data: 'Confirmez votre compte Admin Rcvo' },
-        Body: { Text: { Data: \`Bonjour,\n\nCliquez sur ce lien pour activer votre compte administrateur : \${confirmUrl}\n\nCe lien expire dans 24 heures.\` } }
+        Body: { Text: { Data: `Bonjour,\n\nCliquez sur ce lien pour activer votre compte administrateur : ${confirmUrl}\n\nCe lien expire dans 24 heures.` } }
       }
     }).promise();
 
@@ -108,6 +108,10 @@ app.use('/api', (req, res, next) => {
 
 // Lancement du serveur
 const PORT = process.env.PORT || 8000;
+app.get("/api/admin/me", authenticateToken, (req, res) => {
+  res.json({ id: req.user.sub, role: req.user.role || "admin" });
+});
+
 app.listen(PORT, () => {
-  console.log(\`RCVO API démarrée sur le port \${PORT}\`);
+  console.log(`RCVO API démarrée sur le port ${PORT}`);
 });

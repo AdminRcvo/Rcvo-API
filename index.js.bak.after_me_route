@@ -1,0 +1,113 @@
+require('dotenv').config();
+const express    = require('express');
+const path       = require('path');
+const bodyParser = require('body-parser');
+const jwt        = require('jsonwebtoken');
+const bcrypt     = require('bcrypt');
+const AWS        = require('aws-sdk');
+const { addAdmin, getAdminByEmail } = require('./models/admin');
+const db         = require('./db');
+
+const app = express();
+
+// Middlewares
+app.use(bodyParser.json());
+app.use(express.static(path.join(__dirname, '../ui')));
+
+// UI publiques
+app.get('/login.html',    (req, res) => res.sendFile(path.join(__dirname, '../ui/login.html')));
+app.get('/register.html', (req, res) => res.sendFile(path.join(__dirname, '../ui/register.html')));
+app.get('/confirm.html',  (req, res) => res.sendFile(path.join(__dirname, '../ui/confirm.html')));
+
+// Inscription admin + envoi mail de confirmation
+app.post('/api/admin/register', async (req, res) => {
+  const { email, password } = req.body;
+  try {
+    const hashed = await bcrypt.hash(password, 10);
+    const admin  = await addAdmin(email, hashed);
+
+    const confirmToken = jwt.sign({ sub: admin.id }, process.env.JWT_SECRET, { expiresIn: '24h' });
+    const confirmUrl   = `https://${req.headers.host}/confirm.html?token=${confirmToken}`;
+
+    const ses = new AWS.SES({ region: process.env.AWS_REGION });
+    await ses.sendEmail({
+      Source: process.env.MAIL_SOURCE,
+      Destination: { ToAddresses: [email] },
+      Message: {
+        Subject: { Data: 'Confirmez votre compte Admin Rcvo' },
+        Body: { Text: { Data: `Bonjour,\n\nCliquez sur ce lien pour activer votre compte administrateur : ${confirmUrl}\n\nCe lien expire dans 24 heures.` } }
+      }
+    }).promise();
+
+    res.status(201).json({ id: admin.id, email: admin.email });
+  } catch (err) {
+    console.error(err);
+    if (err.code === 'SQLITE_CONSTRAINT_UNIQUE' || err.code === 'ER_DUP_ENTRY') {
+      res.status(409).json({ message: 'Un administrateur avec cet email existe déjà' });
+    } else {
+      res.status(500).json({ message: 'Erreur lors de l\'inscription' });
+    }
+  }
+});
+
+// Confirmation de compte admin
+app.post('/api/admin/confirm', async (req, res) => {
+  const { token } = req.body;
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    await db.execute('UPDATE admins SET confirmed = TRUE WHERE id = ?', [payload.sub]);
+    res.json({ message: 'Compte confirmé ! Vous pouvez maintenant vous connecter.' });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ message: 'Token invalide ou expiré.' });
+  }
+});
+
+// Connexion admin
+app.post('/api/admin/login', async (req, res) => {
+  const { email, password } = req.body;
+  try {
+    const admin = await getAdminByEmail(email);
+    if (!admin) return res.status(401).json({ message: 'Email ou mot de passe invalide' });
+
+    const valid = await bcrypt.compare(password, admin.hashedPassword);
+    if (!valid) return res.status(401).json({ message: 'Email ou mot de passe invalide' });
+
+    const [[row]] = await db.execute('SELECT confirmed FROM admins WHERE id = ?', [admin.id]);
+    if (!row.confirmed) return res.status(403).json({ message: 'Compte non confirmé.' });
+
+    const token = jwt.sign({ sub: admin.id, role: 'admin' }, process.env.JWT_SECRET, { expiresIn: '8h' });
+    res.json({ token });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Erreur serveur' });
+  }
+});
+
+// Middleware JWT
+function authenticateToken(req, res, next) {
+  const auth = req.headers['authorization'];
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ message: 'Accès refusé' });
+  }
+  const token = auth.slice(7);
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    next();
+  } catch (err) {
+    res.status(401).json({ message: 'Token invalide ou expiré' });
+  }
+}
+
+// Protection des routes /api (sauf celles d'inscription, confirmation, login)
+app.use('/api', (req, res, next) => {
+  const open = ['/api/admin/register', '/api/admin/confirm', '/api/admin/login'];
+  if (open.includes(req.path)) return next();
+  authenticateToken(req, res, next);
+});
+
+// Lancement du serveur
+const PORT = process.env.PORT || 8000;
+app.listen(PORT, () => {
+  console.log(`RCVO API démarrée sur le port ${PORT}`);
+});

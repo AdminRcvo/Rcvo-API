@@ -1,0 +1,22 @@
+{
+    "EnvironmentName": "rcvo-backend-prod",
+    "EnvironmentId": "e-3m98pivcku",
+    "ApplicationName": "Rcvo-backend",
+    "VersionLabel": "app-622f-250814_161513362988-stage-250814_161513363013",
+    "SolutionStackName": "64bit Amazon Linux 2023 v6.6.3 running Node.js 22",
+    "PlatformArn": "arn:aws:elasticbeanstalk:eu-west-3::platform/Node.js 22 running on 64bit Amazon Linux 2023/6.6.3",
+    "Description": "Environment created from the EB CLI using \"eb create\"",
+    "EndpointURL": "awseb-e-3-AWSEBLoa-1D645LQRKO1MD-1755107735.eu-west-3.elb.amazonaws.com",
+    "CNAME": "rcvo-backend-prod.eba-k3tjwhr3.eu-west-3.elasticbeanstalk.com",
+    "DateCreated": "2025-05-27T12:45:07.442000+00:00",
+    "DateUpdated": "2025-08-18T14:49:39.529000+00:00",
+    "Status": "Updating",
+    "AbortableOperationInProgress": true,
+    "Health": "Grey",
+    "Tier": {
+        "Name": "WebServer",
+        "Type": "Standard",
+        "Version": "1.0"
+    },
+    "EnvironmentArn": "arn:aws:elasticbeanstalk:eu-west-3:409818814260:environment/Rcvo-backend/rcvo-backend-prod"
+}
