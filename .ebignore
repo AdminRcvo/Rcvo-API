@@ -1,6 +1,4 @@
-# Exclude node modules & caches
 node_modules/
-.npm/
 *.log
 *.zip
 *.tar.gz
