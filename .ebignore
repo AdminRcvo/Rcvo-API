@@ -1,0 +1,10 @@
+# Exclude node modules & caches
+node_modules/
+.npm/
+*.log
+*.zip
+*.tar.gz
+bundle-*
+.ebextensions/*static.config*
+*.bak
+.git/
