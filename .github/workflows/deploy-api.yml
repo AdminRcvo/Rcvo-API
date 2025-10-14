@@ -1,115 +1,86 @@
-name: RCVO API Deploy (EB via OIDC)
+name: Déployer le backend Rcvo (API) sur Elastic Beanstalk
 
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch: {}
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-west-3
+  EB_APP_NAME: Rcvo-backend
+  EB_ENV_NAME: rcvo-backend-b       # PROD (ne rien changer)
+  HEALTH_PATH: /health
 
 jobs:
-  deploy-api:
+  deploy:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
-    env:
-      EB_APP: Rcvo-backend
-      EB_ENV: Rcvo-Backend-env
-      S3_BUCKET: rcvo-eb-artifacts
-      AWS_REGION_FALLBACK: eu-west-3
-
     steps:
-      - uses: actions/checkout@v4
-
-      # Résout le rôle OIDC quel que soit le nom du secret
-      - name: Resolve OIDC role
-        env:
-          A: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          B: ${{ secrets.AWS_ROLE_PROD }}
-          C: ${{ secrets.ASSISTANT_ROLE_ARN }}
-        run: |
-          ROLE="${A:-${B:-${C:-}}}"
-          if [ -z "$ROLE" ]; then
-            echo "❌ Ajoute un secret: AWS_ROLE_TO_ASSUME ou AWS_ROLE_PROD ou ASSISTANT_ROLE_ARN"
-            exit 1
-          fi
-          echo "ROLE_TO_ASSUME=$ROLE" >> $GITHUB_ENV
-
-      # Région (priorité au secret AWS_REGION)
-      - name: Resolve region
-        env:
-          R: ${{ secrets.AWS_REGION }}
-        run: |
-          echo "REGION=${R:-$AWS_REGION_FALLBACK}" >> $GITHUB_ENV
-
-      - name: Configure AWS (OIDC)
+      - name: Configurer AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.ROLE_TO_ASSUME }}
-          aws-region: ${{ env.REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      # Archive unique (évite l'erreur "Application Version already exists" au re-run)
-      - name: Zip API
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install & Build (auto)
         run: |
-          APP="rcvo-api-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA::7}"
-          echo "APP=${APP}" >> $GITHUB_ENV
-          zip -r "${APP}.zip" .
+          set -e
+          if [ -f pnpm-lock.yaml ]; then npm i -g pnpm && pnpm i --frozen-lockfile && (pnpm run build || true)
+          elif [ -f yarn.lock ]; then corepack enable && yarn install --frozen-lockfile && (yarn build || true)
+          elif [ -f package-lock.json ]; then npm ci && (npm run build || true)
+          else npm i && (npm run build || true); fi
 
-      # Upload + Create EB version (idempotent)
-      - name: Upload & Create EB version (idempotent)
+      - name: Créer bundle/api.zip
         run: |
-          aws s3 cp "${APP}.zip" "s3://${{ env.S3_BUCKET }}/api/${APP}.zip"
+          set -e
+          LABEL="api-$(date +%Y%m%d-%H%M%S)-${GITHUB_RUN_NUMBER}"
+          echo "LABEL=$LABEL" >> $GITHUB_ENV
+          mkdir -p bundle
+          zip -qr bundle/api.zip .
 
-          EXISTS=$(aws elasticbeanstalk describe-application-versions \
-            --application-name "${{ env.EB_APP }}" \
-            --query "length(ApplicationVersions[?VersionLabel=='${APP}'])" \
-            --output text)
-
-          if [ "$EXISTS" -eq 0 ]; then
-            aws elasticbeanstalk create-application-version \
-              --region "${{ env.REGION }}" \
-              --application-name "${{ env.EB_APP }}" \
-              --version-label "${APP}" \
-              --source-bundle S3Bucket="${{ env.S3_BUCKET }}",S3Key="api/${APP}.zip"
-          else
-            echo "⏭️  EB app version '${APP}' existe déjà — skip create."
-          fi
-
-      # Un SEUL update-environment, puis attente explicite Ready
-      - name: Update EB environment (deploy)
+      - name: Upload S3 + créer version EB
         run: |
+          set -e
+          ACC=$(aws sts get-caller-identity --query Account --output text)
+          DSTB="elasticbeanstalk-${AWS_REGION}-${ACC}"
+          KEY="${EB_APP_NAME}/${LABEL}.zip"
+          aws s3 cp bundle/api.zip "s3://${DSTB}/${KEY}"
+          aws elasticbeanstalk create-application-version \
+            --application-name "$EB_APP_NAME" \
+            --version-label "$LABEL" \
+            --source-bundle S3Bucket="$DSTB",S3Key="$KEY" \
+            --process
+
+      - name: Déployer sur Elastic Beanstalk
+        run: |
+          set -e
           aws elasticbeanstalk update-environment \
-            --region "${{ env.REGION }}" \
-            --environment-name "${{ env.EB_ENV }}" \
-            --version-label "${APP}"
+            --environment-name "$EB_ENV_NAME" \
+            --version-label "$LABEL"
 
-      - name: Wait until environment is Ready
+      - name: Attendre Ready/Green + /health
         run: |
-          aws elasticbeanstalk wait environment-updated \
-            --region "${{ env.REGION }}" \
-            --environment-names "${{ env.EB_ENV }}"
-          echo "✅ Environment Ready"
-
-      # Vérif rapide /api/health
-      - name: Quick checks
-        run: |
-          API_LB=$(aws elasticbeanstalk describe-environments \
-            --region "${{ env.REGION }}" \
-            --environment-names "${{ env.EB_ENV }}" \
-            --query 'Environments[0].EndpointURL' --output text)
-          echo "API LB: $API_LB"
-          curl -sI "http://${API_LB}/api/health" | head -n1 || true
-
-      # (Optionnel) Variables d'env API — décommente si tu veux pousser des valeurs depuis les secrets
-      # - name: Update EB env variables
-      #   run: |
-      #     aws elasticbeanstalk update-environment \
-      #       --region "${{ env.REGION }}" \
-      #       --environment-name "${{ env.EB_ENV }}" \
-      #       --option-settings \
-      #        Namespace=aws:elasticbeanstalk:application:environment,OptionName=NODE_ENV,Value=production \
-      #        Namespace=aws:elasticbeanstalk:application:environment,OptionName=CORS_ORIGIN,Value="https://ui.rcvo-crm-auto.com" \
-      #        Namespace=aws:elasticbeanstalk:application:environment,OptionName=DATABASE_URL,Value="${{ secrets.DATABASE_URL }}" \
-      #        Namespace=aws:elasticbeanstalk:application:environment,OptionName=JWT_SECRET,Value="${{ secrets.RCVO_JWT_SECRET }}"
-      #     aws elasticbeanstalk wait environment-updated \
-      #       --region "${{ env.REGION }}" \
-      #       --environment-names "${{ env.EB_ENV }}"
+          set -e
+          for i in {1..60}; do
+            read -r ST HL VER CNAME <<<"$(aws elasticbeanstalk describe-environments \
+              --environment-names "$EB_ENV_NAME" \
+              --query 'Environments[0].[Status,Health,VersionLabel,CNAME]' --output text)"
+            echo "  - $ST / $HL (ver=$VER) $CNAME"
+            [ "$ST" = "Ready" ] && [ "$HL" = "Green" ] && break
+            sleep 10
+          done
+          URL="http://${CNAME}${HEALTH_PATH}"
+          code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL")
+          echo "Health $URL -> $code"
+          [ "$code" = "200" ]
