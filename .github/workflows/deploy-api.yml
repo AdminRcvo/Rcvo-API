@@ -1,79 +1,118 @@
-name: Déployer le backend Rcvo (API) sur Elastic Beanstalk
+name: Deploy backend (OIDC)
 
 on:
   push:
-    branches: [ main, staging ]
+    branches: [main, staging]
   workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
 
-env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
-  EB_APP_NAME: ${{ secrets.EB_APP_NAME }}
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Configurer AWS via OIDC
+      # 1) Code
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2) OIDC -> AWS
+      - name: Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: eu-west-3
 
-      - name: Déterminer l'environnement cible
+      # 3) Choisir l'environnement EB cible
+      - name: Resolve target environment
         id: env
+        shell: bash
         run: |
           set -euo pipefail
           REF="${GITHUB_REF_NAME}"
           if [ "$REF" = "main" ]; then
-            ENV="rcvo-backend-b"              # PROD
+            ENV="rcvo-backend-b"            # PROD (existant)
           elif [ "$REF" = "staging" ]; then
-            ENV="Rcvo-Backend-staging"       # STAGING
+            ENV="Rcvo-Backend-staging"      # STAGING (existant)
           else
-            echo "Branche $REF non supportée (seules main/staging)"; exit 2
+            echo "Branche $REF non supportée (main/staging)"; exit 2
           fi
           echo "name=$ENV" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
-
-      - name: Pack (api.zip)
+      # 4) Créer l'archive à déployer (adapté: zip tout le repo)
+      - name: Build & archive
+        shell: bash
         run: |
           set -euo pipefail
-          zip -qr api.zip . -x ".git/*"
+          mkdir -p bundle
+          # Si tu as un build Node, fais-le ici (npm ci && npm run build)
+          # À défaut on zipe le repo (sans .git)
+          tar -czf bundle/api.tgz --exclude .git .
+          rm -f bundle/api.zip && cp bundle/api.tgz bundle/api.zip
+          test -f bundle/api.zip
 
-      - name: Push S3 + créer version EB
-        id: ver
+      # 5) Créer la version EB (idempotent) et uploader sur S3 EB
+      - name: Create EB application version
+        id: publish
+        shell: bash
         run: |
           set -euo pipefail
-          TS=$(date +%Y%m%d-%H%M%S)
-          LABEL="api-${TS}"
+          APP="Rcvo-backend"
+          LABEL="api-${{ github.run_id }}-${{ github.run_attempt }}"
           ACC=$(aws sts get-caller-identity --query Account --output text)
-          S3B="elasticbeanstalk-${AWS_REGION}-${ACC}"
-          S3K="${EB_APP_NAME}/${LABEL}.zip"
-          aws s3 cp api.zip "s3://${S3B}/${S3K}"
+          BUCKET="elasticbeanstalk-eu-west-3-$ACC"
+          KEY="rcvo-api/${LABEL}.zip"
 
-          # idempotent
-          aws elasticbeanstalk create-application-version \
-            --application-name "$EB_APP_NAME" \
-            --version-label "$LABEL" \
-            --source-bundle S3Bucket="$S3B",S3Key="$S3K" \
-          2>err.log || { grep -q "already exists" err.log || (cat err.log && exit 1); }
+          aws s3 cp bundle/api.zip "s3://$BUCKET/$KEY" >/dev/null
+
+          # Idempotent: only create if missing
+          if ! aws elasticbeanstalk describe-application-versions \
+                --application-name "$APP" \
+                --version-labels "$LABEL" \
+                --query 'ApplicationVersions[0].VersionLabel' \
+                --output text | grep -q "$LABEL"; then
+            aws elasticbeanstalk create-application-version \
+              --application-name "$APP" \
+              --version-label "$LABEL" \
+              --source-bundle S3Bucket="$BUCKET",S3Key="$KEY" >/dev/null
+          fi
 
           echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
-      - name: Vérifier l'existence de l'env EB (fail rapide)
-        run: |
-          set -euo pipefail
-          aws elasticbeanstalk describe-environments \
-            --environment-names "${{ steps.env.outputs.name }}" \
-            --query 'Environments[0].EnvironmentName' --output text | grep .
-
-      - name: Déployer sur EB
+      # 6) Déployer cette version sur l'env
+      - name: Update EB environment
+        shell: bash
         run: |
           set -euo pipefail
           aws elasticbeanstalk update-environment \
             --environment-name "${{ steps.env.outputs.name }}" \
-            --version-label "${{ steps.ver.outputs.label }}"
+            --version-label   "${{ steps.publish.outputs.label }}" >/dev/null
+          echo "Déploiement -> ${{ steps.env.outputs.name }} / ${{ steps.publish.outputs.label }}"
+
+      # 7) Attendre Ready/Green (max 15 minutes)
+      - name: Wait for Ready/Green
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..90}; do
+            read S H <<<"$(aws elasticbeanstalk describe-environments \
+              --environment-names '${{ steps.env.outputs.name }}' \
+              --query 'Environments[0].[Status,Health]' --output text)"
+            echo "  $i: $S / $H"
+            if [ "$S" = "Ready" ] && [ "$H" = "Green" ]; then exit 0; fi
+            sleep 10
+          done
+          echo "Timeout attente EB"; exit 1
+
+      # 8) Smoke test /health
+      - name: Smoke test /health
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="http://$(aws elasticbeanstalk describe-environments \
+            --environment-names '${{ steps.env.outputs.name }}' \
+            --query 'Environments[0].CNAME' --output text)"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' "$URL/health")
+          echo "GET $URL/health -> $code"
+          [ "$code" = "200" ]
