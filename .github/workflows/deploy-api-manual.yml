@@ -1,0 +1,104 @@
+name: Deploy backend (MANUAL, OIDC, safe)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environnement EB (choix OBLIGATOIRE)"
+        required: true
+        type: choice
+        options:
+          - rcvo-backend-b           # prod ACTUEL (existe)
+          - Rcvo-Backend-staging     # staging (existe)
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-west-3
+  APP_NAME: Rcvo-backend
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Valider l'environnement choisi
+        id: envsel
+        shell: bash
+        run: |
+          set -e
+          ENV="${{ inputs.environment }}"
+          case "$ENV" in
+            rcvo-backend-b|Rcvo-Backend-staging) ;;
+            *) echo "⛔ Environnement interdit: $ENV"; exit 2;;
+          esac
+          echo "name=$ENV" >> "$GITHUB_OUTPUT"
+          echo "✅ ENV choisi: $ENV"
+
+      - name: Pack (zip)
+        run: |
+          mkdir -p bundle
+          git rev-parse HEAD > bundle/REVISION.txt
+          zip -qr bundle/api.zip . -x ".git/*"
+
+      - name: Account ID
+        id: acct
+        run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+
+      - name: Upload vers S3 EB
+        id: up
+        env:
+          S3B: elasticbeanstalk-${{ env.AWS_REGION }}-${{ steps.acct.outputs.id }}
+          S3K: rcvo-api/${{ github.run_id }}-${{ github.run_attempt }}.zip
+        run: |
+          aws s3 cp bundle/api.zip "s3://${S3B}/${S3K}"
+          echo "bucket=$S3B" >> $GITHUB_OUTPUT
+          echo "key=$S3K"     >> $GITHUB_OUTPUT
+
+      - name: Créer version EB (idempotent)
+        id: av
+        env:
+          LABEL: deploy-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -e
+          if aws elasticbeanstalk describe-application-versions \
+               --application-name "${{ env.APP_NAME }}" \
+               --version-label "${LABEL}" \
+               --query 'ApplicationVersions[0].VersionLabel' --output text | grep -q "${LABEL}"; then
+            echo "✔ Version déjà existante: ${LABEL}"
+          else
+            aws elasticbeanstalk create-application-version \
+              --application-name "${{ env.APP_NAME }}" \
+              --version-label "${LABEL}" \
+              --source-bundle S3Bucket="${{ steps.up.outputs.bucket }}",S3Key="${{ steps.up.outputs.key }}"
+          fi
+          echo "label=${LABEL}" >> $GITHUB_OUTPUT
+
+      - name: 🔄 Update EB
+        run: |
+          aws elasticbeanstalk update-environment \
+            --environment-name "${{ steps.envsel.outputs.name }}" \
+            --version-label    "${{ steps.av.outputs.label }}"
+
+      - name: Attendre Ready/Green
+        timeout-minutes: 15
+        run: |
+          for i in {1..90}; do
+            read -r STATUS HEALTH VERSION URL <<<"$(aws elasticbeanstalk describe-environments \
+              --environment-names '${{ steps.envsel.outputs.name }}' \
+              --query 'Environments[0].[Status,Health,VersionLabel,EndpointURL]' --output text)"
+            echo "  - $STATUS / $HEALTH ($VERSION) $URL"
+            [ "$STATUS" = "Ready" ] && [ "$HEALTH" = "Green" ] && exit 0
+            sleep 10
+          done
+          echo "⛔ Timeout Ready/Green"; exit 1
