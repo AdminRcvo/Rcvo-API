@@ -1,78 +1,79 @@
-name: Déployer le backend Rcvo (OIDC)
+name: Déployer le backend Rcvo (API) sur Elastic Beanstalk
 
 on:
+  push:
+    branches: [ main, staging ]
   workflow_dispatch:
-    inputs:
-      env:
-        description: "Cible"
-        type: choice
-        required: true
-        options: [staging, prod]
-        default: prod
 
 permissions:
   id-token: write
   contents: read
 
 env:
-  AWS_REGION: eu-west-3
-  APP_NAME: Rcvo-backend
-  ENV_STAGING: Rcvo-Backend-staging
-  ENV_PROD: Rcvo-Backend-prod
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  EB_APP_NAME: ${{ secrets.EB_APP_NAME }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Configurer AWS (OIDC)
+      - name: Configurer AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Résoudre l'environnement cible
-        id: envname
+      - name: Déterminer l'environnement cible
+        id: env
         run: |
-          if [ "${{ inputs.env }}" = "prod" ]; then
-            echo "NAME=${{ env.ENV_PROD }}" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          REF="${GITHUB_REF_NAME}"
+          if [ "$REF" = "main" ]; then
+            ENV="rcvo-backend-b"              # PROD
+          elif [ "$REF" = "staging" ]; then
+            ENV="Rcvo-Backend-staging"       # STAGING
           else
-            echo "NAME=${{ env.ENV_STAGING }}" >> $GITHUB_OUTPUT
+            echo "Branche $REF non supportée (seules main/staging)"; exit 2
           fi
+          echo "name=$ENV" >> "$GITHUB_OUTPUT"
 
-      - name: Préparer artefact (zip)
+      - uses: actions/checkout@v4
+
+      - name: Pack (api.zip)
         run: |
           set -euo pipefail
-          mkdir -p .bundle
-          tar -czf .bundle/api.tar.gz \
-            --exclude='.git' --exclude='node_modules' .
+          zip -qr api.zip . -x ".git/*"
 
-      - name: Créer / réutiliser version EB (idempotent)
-        id: mkver
+      - name: Push S3 + créer version EB
+        id: ver
         run: |
           set -euo pipefail
+          TS=$(date +%Y%m%d-%H%M%S)
+          LABEL="api-${TS}"
           ACC=$(aws sts get-caller-identity --query Account --output text)
-          BUCKET="elasticbeanstalk-${{ env.AWS_REGION }}-${ACC}"
-          LABEL="api-$(date +%Y%m%d-%H%M%S)"
-          KEY="archive/${LABEL}.tar.gz"
+          S3B="elasticbeanstalk-${AWS_REGION}-${ACC}"
+          S3K="${EB_APP_NAME}/${LABEL}.zip"
+          aws s3 cp api.zip "s3://${S3B}/${S3K}"
 
-          # upload artefact
-          aws s3 cp .bundle/api.tar.gz "s3://${BUCKET}/${KEY}" --storage-class STANDARD
+          # idempotent
+          aws elasticbeanstalk create-application-version \
+            --application-name "$EB_APP_NAME" \
+            --version-label "$LABEL" \
+            --source-bundle S3Bucket="$S3B",S3Key="$S3K" \
+          2>err.log || { grep -q "already exists" err.log || (cat err.log && exit 1); }
 
-          # si la version existe déjà, on ne recrée pas
-          if aws elasticbeanstalk describe-application-versions \
-              --application-name "${{ env.APP_NAME }}" \
-              --version-labels "${LABEL}" --query 'ApplicationVersions[0].VersionLabel' --output text | grep -q "${LABEL}"; then
-            echo "Version ${LABEL} existe déjà, on réutilise."
-          else
-            aws elasticbeanstalk create-application-version \
-              --application-name "${{ env.APP_NAME }}" \
-              --version-label "${LABEL}" \
-              --source-bundle S3Bucket="${BUCKET}",S3Key="${KEY}" >/dev/null
-          fi
-          echo "LABEL=${LABEL}" >> $GITHUB_OUTPUT
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
 
-      - name: Déployer sur ${{ steps.envname.outputs.NAME }}
+      - name: Vérifier l'existence de l'env EB (fail rapide)
         run: |
-          set
+          set -euo pipefail
+          aws elasticbeanstalk describe-environments \
+            --environment-names "${{ steps.env.outputs.name }}" \
+            --query 'Environments[0].EnvironmentName' --output text | grep .
+
+      - name: Déployer sur EB
+        run: |
+          set -euo pipefail
+          aws elasticbeanstalk update-environment \
+            --environment-name "${{ steps.env.outputs.name }}" \
+            --version-label "${{ steps.ver.outputs.label }}"
