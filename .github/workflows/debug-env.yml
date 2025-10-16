@@ -1,0 +1,31 @@
+name: Debug EB env resolution
+
+on: { workflow_dispatch: {} }
+
+permissions:
+  id-token: write
+  contents: read
+
+env: { AWS_REGION: eu-west-3 }
+
+jobs:
+  dbg:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+      - shell: bash
+        run: |
+          case "${GITHUB_REF_NAME:-manual}" in
+            main)    ENV="rcvo-backend-b" ;;
+            staging) ENV="Rcvo-Backend-staging" ;;
+            manual)  ENV="rcvo-backend-b" ;;  # si lancé à la main sur default branch
+            *) ENV="(branche non gérée)" ;;
+          esac
+          echo "ENV résolu = $ENV"
+          aws elasticbeanstalk describe-environments \
+            --query 'Environments[*].[EnvironmentName,Status,Health]' \
+            --output table --region eu-west-3
