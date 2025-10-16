@@ -1,9 +1,18 @@
-name: Deploy backend (OIDC) — SINGLE SOURCE OF TRUTH
+name: Deploy backend (OIDC)
 
 on:
   push:
     branches: [main, staging]
   workflow_dispatch:
+    inputs:
+      environment:
+        description: "Choisir l'environnement EB"
+        type: choice
+        options:
+          - rcvo-backend-b
+          - Rcvo-Backend-staging
+        required: true
+        default: rcvo-backend-b
 
 permissions:
   id-token: write
@@ -27,22 +36,25 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Résoudre EB env **sans lire aucune variable**
+      - name: Résoudre le nom d'environnement EB (ZÉRO variable héritée)
         id: envsel
         shell: bash
         run: |
           set -e
-          case "${GITHUB_REF_NAME}" in
-            main)    ENV="rcvo-backend-b" ;;
-            staging) ENV="Rcvo-Backend-staging" ;;
-            *) echo "Branche non gérée: ${GITHUB_REF_NAME}"; exit 2 ;;
-          esac
-          # Garde-fou : interdire toute autre valeur
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENV="${{ inputs.environment }}"
+          else
+            case "${GITHUB_REF_NAME}" in
+              main)    ENV="rcvo-backend-b" ;;
+              staging) ENV="Rcvo-Backend-staging" ;;
+              *) echo "Branche non gérée: ${GITHUB_REF_NAME}"; exit 2 ;;
+            esac
+          fi
           case "$ENV" in rcvo-backend-b|Rcvo-Backend-staging) ;; *)
             echo "Nom d'env interdit: $ENV"; exit 3;;
           esac
           echo "name=$ENV" >> "$GITHUB_OUTPUT"
-          echo "✅ ENV: $ENV"
+          echo "✅ ENV résolu: $ENV"
 
       - name: Pack (zip)
         run: |
@@ -82,9 +94,8 @@ jobs:
               --source-bundle S3Bucket="${{ steps.up.outputs.bucket }}",S3Key="${{ steps.up.outputs.key }}"
           fi
           echo "label=${LABEL}" >> $GITHUB_OUTPUT
-          echo "✅ LABEL: ${LABEL}"
 
-      - name: 🔄 Update EB (utilise UNIQUEMENT la résolution)
+      - name: 🔄 Update EB
         run: |
           aws elasticbeanstalk update-environment \
             --environment-name "${{ steps.envsel.outputs.name }}" \
