@@ -1,4 +1,4 @@
-name: Deploy backend (OIDC)
+name: Deploy backend (OIDC) — FIX
 
 on:
   push:
@@ -12,8 +12,6 @@ permissions:
 env:
   AWS_REGION: eu-west-3
   APP_NAME: Rcvo-backend
-  PROD_ENV: rcvo-backend-b
-  STAGING_ENV: Rcvo-Backend-staging
 
 jobs:
   deploy:
@@ -29,31 +27,30 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Choisir l’environnement EB (selon la branche)
+      - name: Résoudre le bon environnement EB (et l’afficher)
         id: envsel
         shell: bash
         run: |
-          if [ "${GITHUB_REF_NAME}" = "main" ]; then
-            ENV="${{ env.PROD_ENV }}"
-          elif [ "${GITHUB_REF_NAME}" = "staging" ]; then
-            ENV="${{ env.STAGING_ENV }}"
-          else
-            echo "Branche non supportée: ${GITHUB_REF_NAME}"; exit 2
-          fi
+          echo "ref_name=${GITHUB_REF_NAME}"
+          case "${GITHUB_REF_NAME}" in
+            main)    ENV="rcvo-backend-b" ;;
+            staging) ENV="Rcvo-Backend-staging" ;;
+            *) echo "Branche non supportée: ${GITHUB_REF_NAME}"; exit 2 ;;
+          esac
           echo "name=$ENV" >> "$GITHUB_OUTPUT"
-          echo "ENV résolu: $ENV"
+          echo "✅ ENV utilisé: $ENV"
 
-      - name: Préparer l’archive (zip simple)
+      - name: Pack (zip)
         run: |
           mkdir -p bundle
           git rev-parse HEAD > bundle/REVISION.txt
           zip -qr bundle/api.zip . -x ".git/*"
 
-      - name: Récupérer l’ID du compte (pour le bucket EB)
+      - name: Account ID
         id: acct
         run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
 
-      - name: Uploader le bundle sur S3 (bucket EB)
+      - name: Upload vers bucket EB
         id: up
         env:
           S3B: elasticbeanstalk-${{ env.AWS_REGION }}-${{ steps.acct.outputs.id }}
@@ -61,9 +58,9 @@ jobs:
         run: |
           aws s3 cp bundle/api.zip "s3://${S3B}/${S3K}"
           echo "bucket=$S3B" >> $GITHUB_OUTPUT
-          echo "key=$S3K" >> $GITHUB_OUTPUT
+          echo "key=$S3K"     >> $GITHUB_OUTPUT
 
-      - name: Créer la version EB (idempotent)
+      - name: Créer (idempotent) la version EB
         id: av
         env:
           LABEL: deploy-${{ github.run_id }}-${{ github.run_attempt }}
@@ -71,8 +68,9 @@ jobs:
           set -e
           if aws elasticbeanstalk describe-application-versions \
                --application-name "${{ env.APP_NAME }}" \
-               --version-label "${LABEL}" --query 'ApplicationVersions[0].VersionLabel' --output text | grep -q "${LABEL}"; then
-            echo "Version ${LABEL} déjà existante (OK)"
+               --version-label "${LABEL}" \
+               --query 'ApplicationVersions[0].VersionLabel' --output text | grep -q "${LABEL}"; then
+            echo "✔ Version ${LABEL} déjà existante"
           else
             aws elasticbeanstalk create-application-version \
               --application-name "${{ env.APP_NAME }}" \
@@ -80,12 +78,13 @@ jobs:
               --source-bundle S3Bucket="${{ steps.up.outputs.bucket }}",S3Key="${{ steps.up.outputs.key }}"
           fi
           echo "label=${LABEL}" >> $GITHUB_OUTPUT
+          echo "✅ LABEL: ${LABEL}"
 
-      - name: Mettre à jour l’environnement EB
+      - name: ✳️ Update EB vers la nouvelle version (utilise la sortie résolue, pas une variable)
         run: |
           aws elasticbeanstalk update-environment \
             --environment-name "${{ steps.envsel.outputs.name }}" \
-            --version-label "${{ steps.av.outputs.label }}"
+            --version-label    "${{ steps.av.outputs.label }}"
 
       - name: Attendre Ready/Green
         timeout-minutes: 15
@@ -95,9 +94,7 @@ jobs:
               --environment-names "${{ steps.envsel.outputs.name }}" \
               --query 'Environments[0].[Status,Health,VersionLabel,EndpointURL]' --output text)"
             echo "  - $STATUS / $HEALTH ($VERSION) $URL"
-            if [ "$STATUS" = "Ready" ] && [ "$HEALTH" = "Green" ]; then
-              exit 0
-            fi
+            if [ "$STATUS" = "Ready" ] && [ "$HEALTH" = "Green" ]; then exit 0; fi
             sleep 10
           done
-          echo "Environnement non Ready/Green dans le délai"; exit 1
+          echo "⛔ Pas Ready/Green à temps"; exit 1
