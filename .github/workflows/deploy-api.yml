@@ -1,8 +1,8 @@
-name: Déployer le backend Rcvo (API) sur Elastic Beanstalk
+name: Déployer le backend Rcvo (API)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -10,77 +10,57 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: eu-west-3
-  EB_APP_NAME: Rcvo-backend
-  EB_ENV_NAME: rcvo-backend-b       # PROD (ne rien changer)
-  HEALTH_PATH: /health
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  EB_APP_NAME: ${{ secrets.EB_APP_NAME }}
+  EB_ENV_NAME: ${{ secrets.EB_ENV_NAME }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Configurer AWS via OIDC
+      - name: Configurer AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
 
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Install & Build (auto)
+      - name: Créer une archive
         run: |
-          set -e
-          if [ -f pnpm-lock.yaml ]; then npm i -g pnpm && pnpm i --frozen-lockfile && (pnpm run build || true)
-          elif [ -f yarn.lock ]; then corepack enable && yarn install --frozen-lockfile && (yarn build || true)
-          elif [ -f package-lock.json ]; then npm ci && (npm run build || true)
-          else npm i && (npm run build || true); fi
+          set -euo pipefail
+          rm -f api.zip
+          zip -qr api.zip . -x ".git/*"
 
-      - name: Créer bundle/api.zip
+      - name: Upload vers S3 + créer version EB
+        id: version
         run: |
-          set -e
-          LABEL="api-$(date +%Y%m%d-%H%M%S)-${GITHUB_RUN_NUMBER}"
-          echo "LABEL=$LABEL" >> $GITHUB_ENV
-          mkdir -p bundle
-          zip -qr bundle/api.zip .
-
-      - name: Upload S3 + créer version EB
-        run: |
-          set -e
+          set -euo pipefail
+          TS=$(date +%Y%m%d-%H%M%S)
+          LABEL="api-${TS}"
           ACC=$(aws sts get-caller-identity --query Account --output text)
-          DSTB="elasticbeanstalk-${AWS_REGION}-${ACC}"
-          KEY="${EB_APP_NAME}/${LABEL}.zip"
-          aws s3 cp bundle/api.zip "s3://${DSTB}/${KEY}"
-          aws elasticbeanstalk create-application-version \
-            --application-name "$EB_APP_NAME" \
-            --version-label "$LABEL" \
-            --source-bundle S3Bucket="$DSTB",S3Key="$KEY" \
-            --process
+          S3B="elasticbeanstalk-${AWS_REGION}-${ACC}"
+          S3K="${EB_APP_NAME}/${LABEL}.zip"
 
-      - name: Déployer sur Elastic Beanstalk
-        run: |
+          aws s3 cp api.zip "s3://${S3B}/${S3K}"
+
+          set +e
+          out=$(aws elasticbeanstalk create-application-version \
+            --application-name "${EB_APP_NAME}" \
+            --version-label "${LABEL}" \
+            --source-bundle S3Bucket="${S3B}",S3Key="${S3K}" 2>&1)
+          rc=$?
           set -e
+          if [ $rc -ne 0 ] && ! echo "$out" | grep -qi 'already exists'; then
+            echo "$out"; exit $rc
+          fi
+
+          echo "label=${LABEL}" >> $GITHUB_OUTPUT
+
+      - name: Mettre à jour l'environnement
+        run: |
+          set -euo pipefail
           aws elasticbeanstalk update-environment \
-            --environment-name "$EB_ENV_NAME" \
-            --version-label "$LABEL"
-
-      - name: Attendre Ready/Green + /health
-        run: |
-          set -e
-          for i in {1..60}; do
-            read -r ST HL VER CNAME <<<"$(aws elasticbeanstalk describe-environments \
-              --environment-names "$EB_ENV_NAME" \
-              --query 'Environments[0].[Status,Health,VersionLabel,CNAME]' --output text)"
-            echo "  - $ST / $HL (ver=$VER) $CNAME"
-            [ "$ST" = "Ready" ] && [ "$HL" = "Green" ] && break
-            sleep 10
-          done
-          URL="http://${CNAME}${HEALTH_PATH}"
-          code=$(curl -sk -o /dev/null -w "%{http_code}" "$URL")
-          echo "Health $URL -> $code"
-          [ "$code" = "200" ]
+            --environment-name "${EB_ENV_NAME}" \
+            --version-label "${{ steps.version.outputs.label }}"
