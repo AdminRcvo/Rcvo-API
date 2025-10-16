@@ -1,4 +1,4 @@
-name: Deploy backend (OIDC) — FIX
+name: Deploy backend (OIDC) — SINGLE SOURCE OF TRUTH
 
 on:
   push:
@@ -27,18 +27,22 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Résoudre le bon environnement EB (et l’afficher)
+      - name: Résoudre EB env **sans lire aucune variable**
         id: envsel
         shell: bash
         run: |
-          echo "ref_name=${GITHUB_REF_NAME}"
+          set -e
           case "${GITHUB_REF_NAME}" in
             main)    ENV="rcvo-backend-b" ;;
             staging) ENV="Rcvo-Backend-staging" ;;
-            *) echo "Branche non supportée: ${GITHUB_REF_NAME}"; exit 2 ;;
+            *) echo "Branche non gérée: ${GITHUB_REF_NAME}"; exit 2 ;;
+          esac
+          # Garde-fou : interdire toute autre valeur
+          case "$ENV" in rcvo-backend-b|Rcvo-Backend-staging) ;; *)
+            echo "Nom d'env interdit: $ENV"; exit 3;;
           esac
           echo "name=$ENV" >> "$GITHUB_OUTPUT"
-          echo "✅ ENV utilisé: $ENV"
+          echo "✅ ENV: $ENV"
 
       - name: Pack (zip)
         run: |
@@ -50,7 +54,7 @@ jobs:
         id: acct
         run: echo "id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
 
-      - name: Upload vers bucket EB
+      - name: Upload vers S3 EB
         id: up
         env:
           S3B: elasticbeanstalk-${{ env.AWS_REGION }}-${{ steps.acct.outputs.id }}
@@ -60,7 +64,7 @@ jobs:
           echo "bucket=$S3B" >> $GITHUB_OUTPUT
           echo "key=$S3K"     >> $GITHUB_OUTPUT
 
-      - name: Créer (idempotent) la version EB
+      - name: Créer version EB (idempotent)
         id: av
         env:
           LABEL: deploy-${{ github.run_id }}-${{ github.run_attempt }}
@@ -70,7 +74,7 @@ jobs:
                --application-name "${{ env.APP_NAME }}" \
                --version-label "${LABEL}" \
                --query 'ApplicationVersions[0].VersionLabel' --output text | grep -q "${LABEL}"; then
-            echo "✔ Version ${LABEL} déjà existante"
+            echo "✔ Version déjà existante: ${LABEL}"
           else
             aws elasticbeanstalk create-application-version \
               --application-name "${{ env.APP_NAME }}" \
@@ -80,7 +84,7 @@ jobs:
           echo "label=${LABEL}" >> $GITHUB_OUTPUT
           echo "✅ LABEL: ${LABEL}"
 
-      - name: ✳️ Update EB vers la nouvelle version (utilise la sortie résolue, pas une variable)
+      - name: 🔄 Update EB (utilise UNIQUEMENT la résolution)
         run: |
           aws elasticbeanstalk update-environment \
             --environment-name "${{ steps.envsel.outputs.name }}" \
@@ -91,10 +95,10 @@ jobs:
         run: |
           for i in {1..90}; do
             read -r STATUS HEALTH VERSION URL <<<"$(aws elasticbeanstalk describe-environments \
-              --environment-names "${{ steps.envsel.outputs.name }}" \
+              --environment-names '${{ steps.envsel.outputs.name }}' \
               --query 'Environments[0].[Status,Health,VersionLabel,EndpointURL]' --output text)"
             echo "  - $STATUS / $HEALTH ($VERSION) $URL"
-            if [ "$STATUS" = "Ready" ] && [ "$HEALTH" = "Green" ]; then exit 0; fi
+            [ "$STATUS" = "Ready" ] && [ "$HEALTH" = "Green" ] && exit 0
             sleep 10
           done
-          echo "⛔ Pas Ready/Green à temps"; exit 1
+          echo "⛔ Timeout Ready/Green"; exit 1
