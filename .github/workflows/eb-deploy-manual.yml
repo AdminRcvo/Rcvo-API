@@ -1,0 +1,65 @@
+name: Manual EB Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: AWS Region
+        default: eu-west-3
+        required: true
+      app_name:
+        description: EB ApplicationName (ex: Rcvo-backend ou Rcvo-UI)
+        required: true
+      env_name:
+        description: EB EnvironmentName (ex: rcvo-backend-b ou Rcvo-UI-prod)
+        required: true
+      version_label:
+        description: (Optionnel) VersionLabel à déployer, sinon redéploie la version courante
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ inputs.region }}
+
+      - name: Update environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.version_label || '' }}" ]; then
+            aws elasticbeanstalk update-environment \
+              --environment-name "${{ inputs.env_name }}" \
+              --version-label "${{ inputs.version_label }}"
+          else
+            CUR_VER=$(aws elasticbeanstalk describe-environments \
+              --environment-names "${{ inputs.env_name }}" \
+              --query 'Environments[0].VersionLabel' --output text)
+            aws elasticbeanstalk update-environment \
+              --environment-name "${{ inputs.env_name }}" \
+              --version-label "$CUR_VER"
+          fi
+
+      - name: Wait Ready/Green
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..60}; do
+            read -r STATUS HEALTH VERSION URL <<<"$(aws elasticbeanstalk describe-environments \
+              --environment-names "${{ inputs.env_name }}" \
+              --query 'Environments[0].[Status,Health,VersionLabel,EndpointURL]' --output text)"
+            echo "  - $STATUS / $HEALTH ($VERSION)"
+            [ "$STATUS" = "Ready" ] && [ "$HEALTH" = "Green" ] && exit 0
+            sleep 10
+          done
+          echo "Timeout en attente de Ready/Green"; exit 1
