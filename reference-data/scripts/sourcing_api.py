@@ -12,10 +12,15 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/"src"))
 
 from reference_engine import connect, init_db, norm_domain, norm_email, promote_many
+from prospecting_engine import (
+    claim_due, eligible_contacts, enroll_contacts, enroll_eligible,
+    record_events, register_message_version, release_claim, suppress, upsert_campaign
+)
 
 class Server(ThreadingHTTPServer):
     db:Path
     token_env:str
+    prospecting_token_env:str
 
 def exact_lookup(db:Path,payload:dict) -> dict:
     source_key=str(payload.get("source_key") or "").strip()
@@ -110,8 +115,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _auth(self):
-        expected=os.getenv(self.server.token_env)
+    def _auth(self,scope="sourcing"):
+        env_name=self.server.token_env if scope=="sourcing" else self.server.prospecting_token_env
+        expected=os.getenv(env_name)
         return bool(expected and self.headers.get("Authorization")=="Bearer "+expected)
 
     def _body(self,max_bytes:int=20*1024*1024):
@@ -137,7 +143,8 @@ class Handler(BaseHTTPRequestHandler):
         self._write(404,{"error":"not_found"})
 
     def do_POST(self):
-        if not self._auth():
+        prospecting=self.path.startswith("/v1/prospecting/")
+        if not self._auth("prospecting" if prospecting else "sourcing"):
             self._write(401,{"error":"unauthorized"})
             return
         try:
@@ -156,6 +163,55 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 self._write(200,result)
                 return
+
+            if self.path=="/v1/prospecting/campaigns/upsert":
+                self._write(200,upsert_campaign(self.server.db,body))
+                return
+            if self.path=="/v1/prospecting/messages/register":
+                self._write(200,register_message_version(self.server.db,body))
+                return
+            if self.path=="/v1/prospecting/eligible":
+                self._write(200,{"contacts":eligible_contacts(self.server.db,body.get("limit",1000))})
+                return
+            if self.path=="/v1/prospecting/enroll":
+                campaign=str(body.get("campaign_rcvo_id") or "")
+                ids=body.get("contact_rcvo_ids")
+                if ids is None:
+                    self._write(200,enroll_eligible(self.server.db,campaign,body.get("limit",5000)))
+                else:
+                    if not isinstance(ids,list):
+                        raise ValueError("contact_rcvo_ids must be an array")
+                    self._write(200,enroll_contacts(self.server.db,campaign,[str(x) for x in ids]))
+                return
+            if self.path=="/v1/prospecting/claim":
+                self._write(200,{"contacts":claim_due(
+                    self.server.db,
+                    str(body.get("campaign_rcvo_id") or ""),
+                    str(body.get("worker_id") or ""),
+                    body.get("limit",200),
+                    body.get("lease_seconds",300),
+                )})
+                return
+            if self.path=="/v1/prospecting/release":
+                release_claim(
+                    self.server.db,
+                    int(body["campaign_contact_id"]),
+                    str(body.get("worker_id") or ""),
+                    next_eligible_at=body.get("next_eligible_at"),
+                    error=bool(body.get("error",False)),
+                )
+                self._write(200,{"released":True})
+                return
+            if self.path=="/v1/prospecting/events/batch":
+                events=body.get("events")
+                if not isinstance(events,list):
+                    raise ValueError("events array required")
+                self._write(200,record_events(self.server.db,events))
+                return
+            if self.path=="/v1/prospecting/suppress":
+                self._write(200,suppress(self.server.db,body))
+                return
+
             self._write(404,{"error":"not_found"})
         except Exception as exc:
             self._write(400,{"error":"bad_request","message":str(exc)})
@@ -166,12 +222,14 @@ def main():
     p.add_argument("--bind",default="127.0.0.1")
     p.add_argument("--port",type=int,default=8092)
     p.add_argument("--token-env",default="RCVO_REFERENCE_SOURCING_TOKEN")
+    p.add_argument("--prospecting-token-env",default="RCVO_REFERENCE_PROSPECTION_TOKEN")
     args=p.parse_args()
 
     init_db(args.db)
     server=Server((args.bind,args.port),Handler)
     server.db=args.db
     server.token_env=args.token_env
+    server.prospecting_token_env=args.prospecting_token_env
     server.serve_forever()
 
 if __name__=="__main__":

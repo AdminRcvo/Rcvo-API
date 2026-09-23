@@ -1,0 +1,39 @@
+{
+  "rcvo_id": "CMP-RCVO-LANCEMENT",
+  "name": "Rcvo - Campagne principale",
+  "status": "running",
+  "post_campaign_cooldown_days": 180,
+  "eligibility": {
+    "market": "automobile_vo",
+    "qualification": ["usable", "qualified"],
+    "vo_relevance": ["likely", "confirmed"]
+  },
+  "sequence": [
+    {
+      "message_key": "rcvo-introduction",
+      "version": 1,
+      "subject": "Rcvo — une autre façon de suivre les recherches VO",
+      "text": "Bonjour {first_name},\n\nJe vous présente Rcvo, conçu pour faciliter le suivi des recherches clients VO et les rapprochements avec le stock.\n\n{video_url}",
+      "html": "<p>Bonjour {first_name},</p><p>Je vous présente <strong>Rcvo</strong>, conçu pour faciliter le suivi des recherches clients VO et les rapprochements avec le stock.</p><p><a href=\"{video_url}\">Voir la présentation Rcvo</a></p>",
+      "video_url": "https://media.rcvo-crm-auto.com/video-maitre.mp4",
+      "next_delay_hours": 168
+    },
+    {
+      "message_key": "rcvo-relance-1",
+      "version": 1,
+      "subject": "Rcvo — présentation VO",
+      "text": "Bonjour {first_name},\n\nJe me permets de revenir vers vous au sujet de Rcvo. La présentation reste disponible ici : {video_url}",
+      "html": "<p>Bonjour {first_name},</p><p>Je me permets de revenir vers vous au sujet de Rcvo.</p><p><a href=\"{video_url}\">Voir la présentation</a></p>",
+      "video_url": "https://media.rcvo-crm-auto.com/video-maitre.mp4",
+      "next_delay_hours": 336
+    },
+    {
+      "message_key": "rcvo-relance-2",
+      "version": 1,
+      "subject": "Rcvo — dernière présentation",
+      "text": "Bonjour {first_name},\n\nDernier message de ma part concernant Rcvo. Si le sujet vous intéresse, la présentation reste accessible ici : {video_url}",
+      "html": "<p>Bonjour {first_name},</p><p>Dernier message de ma part concernant Rcvo.</p><p><a href=\"{video_url}\">Voir la présentation</a></p>",
+      "video_url": "https://media.rcvo-crm-auto.com/video-maitre.mp4"
+    }
+  ]
+}

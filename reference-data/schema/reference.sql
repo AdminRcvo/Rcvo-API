@@ -359,6 +359,11 @@ CREATE TABLE IF NOT EXISTS campaign_contacts (
         CHECK(status IN ('eligible','queued','sent','responded','suppressed','completed','error')),
     next_eligible_at TEXT,
     last_event_at TEXT,
+    step_index INTEGER NOT NULL DEFAULT 0,
+    send_attempts INTEGER NOT NULL DEFAULT 0,
+    claimed_by TEXT,
+    claimed_at TEXT,
+    lease_until TEXT,
     UNIQUE(campaign_id,contact_id)
 );
 CREATE INDEX IF NOT EXISTS idx_campaign_contacts_status
@@ -372,14 +377,16 @@ CREATE TABLE IF NOT EXISTS prospecting_events (
     event_type TEXT NOT NULL
         CHECK(event_type IN (
             'enrolled','queued','email_sent','email_delivered','email_opened',
-            'link_clicked','reply_received','followup_scheduled','followup_sent',
-            'bounce','optout','campaign_skipped','campaign_completed','manual_note'
+            'link_clicked','video_viewed','reply_received','followup_scheduled','followup_sent',
+            'soft_bounce','bounce','spam_complaint','optout','unsubscribe_requested',
+            'delivery_deferred','delivery_rejected','campaign_skipped','campaign_completed','manual_note'
         )),
     channel TEXT NOT NULL DEFAULT 'email',
     occurred_at TEXT NOT NULL,
     sender_mailbox TEXT,
     message_key TEXT,
     provider_message_id TEXT,
+    event_key TEXT UNIQUE,
     result TEXT,
     metadata_json TEXT
 );
@@ -387,6 +394,25 @@ CREATE INDEX IF NOT EXISTS idx_prospecting_contact
     ON prospecting_events(contact_id,occurred_at);
 CREATE INDEX IF NOT EXISTS idx_prospecting_campaign
     ON prospecting_events(campaign_id,occurred_at);
+CREATE INDEX IF NOT EXISTS idx_prospecting_event_key
+    ON prospecting_events(event_key);
+
+CREATE TABLE IF NOT EXISTS prospecting_message_versions (
+    id INTEGER PRIMARY KEY,
+    message_key TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    subject_template TEXT NOT NULL,
+    text_template TEXT NOT NULL,
+    html_template TEXT,
+    video_url TEXT,
+    content_sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(message_key,version),
+    UNIQUE(content_sha256)
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_versions_key
+    ON prospecting_message_versions(message_key,version);
 
 CREATE TABLE IF NOT EXISTS prospecting_state (
     contact_id INTEGER PRIMARY KEY REFERENCES contacts(id),
@@ -478,7 +504,7 @@ WHERE
     AND m.qualification_status IN ('usable','qualified')
     AND m.vo_relevance IN ('likely','confirmed')
     AND m.email_status NOT IN ('invalid','bounced','unsubscribed')
-    AND COALESCE(ps.status,'never_contacted') NOT IN ('suppressed','customer')
+    AND COALESCE(ps.status,'never_contacted') NOT IN ('responded','paused','suppressed','customer')
     AND (ps.next_eligible_at IS NULL OR ps.next_eligible_at <= strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     AND NOT EXISTS (
         SELECT 1

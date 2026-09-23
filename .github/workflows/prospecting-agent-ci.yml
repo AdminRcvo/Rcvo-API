@@ -1,0 +1,50 @@
+name: Rcvo Prospecting Agent CI
+
+on:
+  push:
+    branches:
+      - "foundation/rcvo-prospection-data-v1"
+    paths:
+      - "prospecting-agent/**"
+      - "reference-data/**"
+      - ".github/workflows/prospecting-agent-ci.yml"
+  pull_request:
+    paths:
+      - "prospecting-agent/**"
+      - "reference-data/**"
+      - ".github/workflows/prospecting-agent-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  prospecting-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install -r prospecting-agent/requirements.txt
+      - name: Compile
+        run: |
+          python -m compileall -q prospecting-agent/src
+          python -m compileall -q reference-data/src reference-data/scripts
+      - name: Reference tests
+        working-directory: reference-data
+        run: python -m unittest discover -s tests -v
+      - name: Prospecting Agent tests
+        working-directory: prospecting-agent
+        run: python -m unittest discover -s tests -v
+      - name: Build Prospecting Agent image
+        run: docker build -t rcvo-prospecting-agent-candidate prospecting-agent
+      - name: Candidate isolation
+        run: |
+          git fetch origin main
+          git diff --name-only origin/main...HEAD > /tmp/changed.txt
+          unexpected="$(grep -Ev '^(.github/workflows/.*.yml|prospection-data/|reference-data/|sourcing-agent/|prospecting-agent/|integration-tests/)' /tmp/changed.txt || true)"
+          if [ -n "$unexpected" ]; then
+            echo "$unexpected"
+            exit 1
+          fi
