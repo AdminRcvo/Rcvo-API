@@ -191,18 +191,28 @@ class ProspectingAgent:
         return processed
 
     def process_once(self):
-        counters={"claimed":0,"sent":0,"synced":0,"skipped":0,"failed":0,"uncertain":0}
+        counters={"claimed":0,"sent":0,"synced":0,"skipped":0,"failed":0,"uncertain":0,"simulated":0}
         counters["synced"]+=self.sync_suppressions()
         counters["synced"]+=self.sync_feedback()
         counters["synced"]+=self.sync_unsynced()
         self.poll_inboxes()
         counters["synced"]+=self.sync_suppressions()
         counters["synced"]+=self.sync_feedback()
+
+        control=self.state.control()
+        if control["outbound_state"]!="on":
+            return counters
+        if control["mode"]=="simulation":
+            return counters
+
         capacity=self._available_mailbox_count()
         if capacity<=0:
             return counters
+        claim_limit=min(self.config.claim_size,capacity)
+        if control["mode"]=="pilot":
+            claim_limit=min(claim_limit,5)
         contacts=self.reference.claim(
-            self.campaign_id,self.worker_id,min(self.config.claim_size,capacity),
+            self.campaign_id,self.worker_id,claim_limit,
             self.config.lease_seconds
         )
         counters["claimed"]=len(contacts)
