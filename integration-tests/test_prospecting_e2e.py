@@ -96,6 +96,7 @@ class ProspectingE2E(unittest.TestCase):
         )
         boot=agent.bootstrap()
         self.assertEqual(boot["enrolled"],1)
+        agent.state.set_control("on","production")
         result=agent.process_once()
         self.assertEqual(result["sent"],1)
         self.assertEqual(result["synced"],1)
