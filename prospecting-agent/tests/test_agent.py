@@ -8,6 +8,7 @@ sys.path.insert(0,str(ROOT/"src"))
 
 from agent import ProspectingAgent,RuntimeConfig
 from deliverability import Gate,health_gate
+from inbound import classify
 from mailer import build_message
 from state import State
 
@@ -155,6 +156,34 @@ class ProspectingAgentTests(unittest.TestCase):
         text=msg.get_body(preferencelist=("plain",)).get_content()
         self.assertIn("Se désinscrire" if False else "ne plus recevoir",text.lower())
         self.assertIn("Adresse Rcvo",text)
+
+    def test_inbound_reply_and_dsn_are_classified(self):
+        reply=(
+            b"From: prospect@garage.fr\r\n"
+            b"To: sender@example.com\r\n"
+            b"Subject: Re: Rcvo\r\n"
+            b"In-Reply-To: <abc@example.com>\r\n"
+            b"\r\nMerci"
+        )
+        event=classify(reply)
+        self.assertEqual(event["event_type"],"reply_received")
+        self.assertEqual(event["message_id"],"<abc@example.com>")
+
+        dsn=(
+            b"From: MAILER-DAEMON@example.net\r\n"
+            b"Subject: Delivery Status Notification\r\n"
+            b"Content-Type: multipart/report; report-type=delivery-status; boundary=x\r\n"
+            b"\r\n--x\r\nContent-Type: text/plain\r\n\r\nFailed\r\n"
+            b"--x\r\nContent-Type: message/delivery-status\r\n\r\n"
+            b"Final-Recipient: rfc822; bad@example.com\r\n"
+            b"Action: failed\r\nStatus: 5.1.1\r\n\r\n"
+            b"--x\r\nContent-Type: message/rfc822\r\n\r\n"
+            b"Message-ID: <abc@example.com>\r\nFrom: sender@example.com\r\nTo: bad@example.com\r\n\r\n"
+            b"--x--\r\n"
+        )
+        bounce=classify(dsn)
+        self.assertEqual(bounce["event_type"],"bounce")
+        self.assertEqual(bounce["message_id"],"<abc@example.com>")
 
     def test_complaint_health_gate_blocks(self):
         gate=health_gate({"pause_on_any_complaint":True},{"sent":1000,"spam_complaint":1})
