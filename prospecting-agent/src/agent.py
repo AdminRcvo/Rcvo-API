@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from deliverability import dns_preflight,mailbox_gate
+from inbound import scan_mailbox
 from mailer import build_message,content_hash,safe_format,transport_for
 from tokens import sign
 from state import State
@@ -176,11 +177,27 @@ class ProspectingAgent:
                 synced+=1
         return synced
 
+    def poll_inboxes(self):
+        processed=0
+        for mailbox in self.config.mailboxes:
+            if not mailbox.get("imap_enabled",False):
+                continue
+            try:
+                result=scan_mailbox(mailbox,self.handle_feedback,limit=int(mailbox.get("imap_scan_limit",100)))
+                processed+=int(result.get("processed",0))
+            except Exception as exc:
+                if mailbox.get("pause_on_inbound_failure",True):
+                    self.state.pause_mailbox(mailbox["mailbox_id"],"inbound_monitor_failure:"+str(exc))
+        return processed
+
     def process_once(self):
         counters={"claimed":0,"sent":0,"synced":0,"skipped":0,"failed":0,"uncertain":0}
         counters["synced"]+=self.sync_suppressions()
         counters["synced"]+=self.sync_feedback()
         counters["synced"]+=self.sync_unsynced()
+        self.poll_inboxes()
+        counters["synced"]+=self.sync_suppressions()
+        counters["synced"]+=self.sync_feedback()
         capacity=self._available_mailbox_count()
         if capacity<=0:
             return counters
