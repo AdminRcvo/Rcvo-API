@@ -69,22 +69,11 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 p=verify(token,self.server.agent.config.tracking_secret)
                 if p.get("kind")!="unsubscribe": raise ValueError("wrong token")
-                self.server.agent.request_unsubscribe(
-                    p["contact_rcvo_id"],p.get("campaign_rcvo_id")
-                )
-                try:
-                    self.server.agent.reference.events([{
-                        "event_type":"unsubscribe_requested",
-                        "event_key":"unsubscribe:"+token[-24:],
-                        "contact_rcvo_id":p["contact_rcvo_id"],
-                        "campaign_rcvo_id":p.get("campaign_rcvo_id"),
-                        "result":"user_unsubscribed",
-                        "source":"unsubscribe_link",
-                    }])
-                except Exception:
-                    pass
+                safe=html.escape(token,quote=True)
                 body=("<!doctype html><meta charset=utf-8><title>Désinscription Rcvo</title>"
-                      "<h1>Désinscription confirmée</h1><p>Cette adresse ne recevra plus de sollicitations Rcvo.</p>").encode()
+                      "<h1>Désinscription Rcvo</h1><p>Confirmer l’arrêt des sollicitations Rcvo.</p>"
+                      "<form method=\"post\" action=\"/unsubscribe/"+safe+"\">"
+                      "<button type=\"submit\">Se désinscrire</button></form>").encode()
                 self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8")
                 self.send_header("Content-Length",str(len(body))); self.end_headers(); self.wfile.write(body)
             except Exception as exc: self._json(400,{"error":str(exc)})
@@ -117,7 +106,28 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path=urlparse(self.path).path
         if path.startswith("/unsubscribe/"):
-            return self.do_GET()
+            token=path.rsplit("/",1)[1]
+            try:
+                p=verify(token,self.server.agent.config.tracking_secret)
+                if p.get("kind")!="unsubscribe": raise ValueError("wrong token")
+                self.server.agent.request_unsubscribe(
+                    p["contact_rcvo_id"],p.get("campaign_rcvo_id")
+                )
+                try:
+                    self.server.agent.reference.events([{
+                        "event_type":"unsubscribe_requested",
+                        "event_key":"unsubscribe:"+token[-24:],
+                        "contact_rcvo_id":p["contact_rcvo_id"],
+                        "campaign_rcvo_id":p.get("campaign_rcvo_id"),
+                        "result":"user_unsubscribed",
+                        "source":"unsubscribe_one_click",
+                    }])
+                except Exception:
+                    pass
+                self._json(200,{"status":"unsubscribed"})
+            except Exception as exc:
+                self._json(400,{"error":str(exc)})
+            return
         if path.startswith("/video-event/"):
             token=path.rsplit("/",1)[1]
             try:
