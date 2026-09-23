@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import copy
-import json
 import os
 import socket
 import time
@@ -37,10 +35,10 @@ class SourcingAgent:
         self.state=state
         self.config=config or AgentConfig()
         self.profiles=profiles or ProfileRegistry(None)
-        for source_key,profile,sha in self.profiles.items():
-            self.state.register_profile(source_key,sha,profile)
         if self.config.mode not in {"simulation","production"}:
             raise ValueError("mode must be simulation or production")
+        for source_key,profile,sha in self.profiles.items():
+            self.state.register_profile(source_key,sha,profile)
         self.worker_id=self.config.worker_id or (
             f"sourcing-{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         )
@@ -70,20 +68,22 @@ class SourcingAgent:
         result={
             "raw_ref":{
                 "source_key":source_key,
-                "raw_batch_uuid":item.raw_batch_uuid or str(item.batch_id if item.batch_id is not None else "unknown"),
+                "raw_batch_uuid":item.raw_batch_uuid or str(
+                    item.batch_id if item.batch_id is not None else "unknown"
+                ),
                 "raw_record_id":item.id,
                 "source_record_id":item.source_record_id,
             },
-            "contact":copy.deepcopy(normalized.contact),
+            "contact":dict(normalized.contact),
         }
         if normalized.email:
-            result["email"]=copy.deepcopy(normalized.email)
+            result["email"]=dict(normalized.email)
         if normalized.phone:
-            result["phone"]=copy.deepcopy(normalized.phone)
+            result["phone"]=dict(normalized.phone)
         if normalized.organization:
-            result["organization"]=copy.deepcopy(normalized.organization)
+            result["organization"]=dict(normalized.organization)
         if normalized.employment:
-            result["employment"]=copy.deepcopy(normalized.employment)
+            result["employment"]=dict(normalized.employment)
         if lookup.contact_rcvo_id:
             result["contact_match_rcvo_id"]=lookup.contact_rcvo_id
         if lookup.organization_rcvo_id:
@@ -95,6 +95,32 @@ class SourcingAgent:
     def process_batch(self) -> dict[str,Any]:
         run=self.state.start_run(self.worker_id,self.config.mode)
         counters={"claimed":0,"promoted":0,"enriched":0,"rejected":0,"failed":0}
+        decision_logs:list[dict[str,Any]]=[]
+
+        def log_decision(
+            item:RawItem,
+            decision:str,
+            *,
+            source_key:str|None=None,
+            lookup:CandidateLookup|None=None,
+            qualification_status:str|None=None,
+            vo_relevance:str|None=None,
+            reasons:list[str]|None=None,
+        ):
+            decision_logs.append({
+                "run_uuid":run,
+                "raw_record_id":item.id,
+                "decision":decision,
+                "source_key":source_key,
+                "contact_rcvo_id":lookup.contact_rcvo_id if lookup else None,
+                "organization_rcvo_id":lookup.organization_rcvo_id if lookup else None,
+                "qualification_status":qualification_status,
+                "vo_relevance":vo_relevance,
+                "match_methods":lookup.methods if lookup else [],
+                "reasons":reasons or [],
+                "details":None,
+            })
+
         try:
             items=self.raw.claim(
                 self.worker_id,self.config.claim_size,self.config.lease_seconds
@@ -108,7 +134,9 @@ class SourcingAgent:
             for item in items:
                 try:
                     source_key=self._source_key(item)
-                    normalized=normalize(item.payload,source_key,self.profiles.get(source_key))
+                    normalized=normalize(
+                        item.payload,source_key,self.profiles.get(source_key)
+                    )
                     lookup=self.reference.lookup(normalized.as_lookup())
                     if lookup.conflicts:
                         self.raw.reject(
@@ -116,13 +144,10 @@ class SourcingAgent:
                             "reference_conflict: "+"; ".join(lookup.conflicts)
                         )
                         counters["rejected"]+=1
-                        self.state.decision(
-                            run,item.id,"needs_review",source_key=source_key,
-                            contact_rcvo_id=lookup.contact_rcvo_id,
-                            organization_rcvo_id=lookup.organization_rcvo_id,
+                        log_decision(
+                            item,"needs_review",source_key=source_key,lookup=lookup,
                             qualification_status=normalized.contact["qualification_status"],
                             vo_relevance=normalized.contact["vo_relevance"],
-                            match_methods=lookup.methods,
                             reasons=normalized.reasons+lookup.conflicts,
                         )
                         continue
@@ -133,21 +158,17 @@ class SourcingAgent:
                     state=self.raw.fail(self.worker_id,item.id,str(exc))
                     counters["failed"]+=1
                     self.state.error(run,exc,item.id)
-                    self.state.decision(run,item.id,state,reasons=[str(exc)])
+                    log_decision(item,state,reasons=[str(exc)])
 
             if self.config.mode=="simulation":
                 for item,promotion,normalized,lookup,source_key in prepared:
                     self.raw.release(self.worker_id,item.id)
                     counters["promoted"]+=1
-                    self.state.decision(
-                        run,item.id,"simulated",source_key=source_key,
-                        contact_rcvo_id=lookup.contact_rcvo_id,
-                        organization_rcvo_id=lookup.organization_rcvo_id,
+                    log_decision(
+                        item,"simulated",source_key=source_key,lookup=lookup,
                         qualification_status=normalized.contact["qualification_status"],
                         vo_relevance=normalized.contact["vo_relevance"],
-                        match_methods=lookup.methods,
                         reasons=normalized.reasons,
-                        details={"promotion":promotion},
                     )
             elif prepared:
                 promotions=[x[1] for x in prepared]
@@ -163,7 +184,9 @@ class SourcingAgent:
                         for i in range(1,len(prepared)+1)
                     ]
                 if len(item_results)!=len(prepared):
-                    raise RuntimeError("reference result count does not match submitted promotions")
+                    raise RuntimeError(
+                        "reference result count does not match submitted promotions"
+                    )
 
                 for idx,(item,promotion,normalized,lookup,source_key) in enumerate(prepared):
                     out=item_results[idx]
@@ -172,26 +195,36 @@ class SourcingAgent:
                         counters["promoted"]+=1
                         if out.get("status")=="enriched":
                             counters["enriched"]+=1
-                        self.state.decision(
-                            run,item.id,out.get("status","promoted"),
-                            source_key=source_key,
+                        resolved=CandidateLookup(
                             contact_rcvo_id=out.get("contact_rcvo_id") or lookup.contact_rcvo_id,
                             organization_rcvo_id=out.get("organization_rcvo_id") or lookup.organization_rcvo_id,
+                            site_rcvo_id=out.get("site_rcvo_id") or lookup.site_rcvo_id,
+                            methods=lookup.methods,
+                            conflicts=[],
+                        )
+                        log_decision(
+                            item,out.get("status","promoted"),
+                            source_key=source_key,lookup=resolved,
                             qualification_status=normalized.contact["qualification_status"],
                             vo_relevance=normalized.contact["vo_relevance"],
-                            match_methods=lookup.methods,
                             reasons=normalized.reasons,
                         )
                     else:
                         error=str(out.get("error","reference promotion failed"))
-                        self.raw.fail(self.worker_id,item.id,error)
+                        state=self.raw.fail(self.worker_id,item.id,error)
                         counters["failed"]+=1
-                        self.state.error(run,error,item.id,details=out)
+                        self.state.error(run,error,item.id)
+                        log_decision(item,state,reasons=[error])
 
+            self.state.decision_many(decision_logs)
             status="complete" if counters["failed"]==0 else "partial"
             self.state.finish_run(run,status,counters)
             return counters
         except Exception as exc:
+            try:
+                self.state.decision_many(decision_logs)
+            except Exception:
+                pass
             self.state.error(run,exc)
             self.state.finish_run(run,"failed",counters,{"error":str(exc)})
             raise

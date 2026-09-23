@@ -93,6 +93,8 @@ class AgentState:
         conn=sqlite3.connect(self.path,timeout=20)
         conn.row_factory=sqlite3.Row
         conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     def start_run(self,worker_id:str,mode:str) -> str:
@@ -131,8 +133,33 @@ class AgentState:
         vo_relevance:str|None=None,match_methods:list[str]|None=None,
         reasons:list[str]|None=None,details:Any=None,
     ) -> None:
+        self.decision_many([{
+            "run_uuid":run_uuid,"raw_record_id":raw_record_id,"decision":decision,
+            "source_key":source_key,"contact_rcvo_id":contact_rcvo_id,
+            "organization_rcvo_id":organization_rcvo_id,
+            "qualification_status":qualification_status,"vo_relevance":vo_relevance,
+            "match_methods":match_methods or [],"reasons":reasons or [],
+            "details":details,
+        }])
+
+    def decision_many(self,entries:list[dict[str,Any]]) -> None:
+        if not entries:
+            return
+        occurred=now()
+        rows=[]
+        for e in entries:
+            rows.append((
+                e["run_uuid"],e["raw_record_id"],e.get("source_key"),e["decision"],
+                e.get("contact_rcvo_id"),e.get("organization_rcvo_id"),
+                e.get("qualification_status"),e.get("vo_relevance"),
+                json.dumps(e.get("match_methods") or [],ensure_ascii=False,separators=(",",":")),
+                json.dumps(e.get("reasons") or [],ensure_ascii=False,separators=(",",":")),
+                occurred,
+                json.dumps(e.get("details"),ensure_ascii=False,separators=(",",":"),default=str)
+                    if e.get("details") is not None else None,
+            ))
         with self.connect() as conn:
-            conn.execute(
+            conn.executemany(
                 """
                 INSERT OR REPLACE INTO sourcing_decisions(
                     run_uuid,raw_record_id,source_key,decision,contact_rcvo_id,
@@ -140,14 +167,7 @@ class AgentState:
                     match_methods_json,reasons_json,occurred_at,details_json
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
-                (
-                    run_uuid,raw_record_id,source_key,decision,contact_rcvo_id,
-                    organization_rcvo_id,qualification_status,vo_relevance,
-                    json.dumps(match_methods or [],ensure_ascii=False,separators=(",",":")),
-                    json.dumps(reasons or [],ensure_ascii=False,separators=(",",":")),
-                    now(),
-                    json.dumps(details,ensure_ascii=False,separators=(",",":"),default=str) if details is not None else None,
-                ),
+                rows,
             )
 
     def error(self,run_uuid:str,error:Exception|str,raw_record_id:int|None=None,details:Any=None) -> None:

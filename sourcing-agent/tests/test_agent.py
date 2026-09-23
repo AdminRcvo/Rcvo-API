@@ -10,6 +10,7 @@ from agent import AgentConfig,SourcingAgent
 from contracts import CandidateLookup,RawItem
 from fake_gateways import MemoryRawGateway,MemoryReferenceGateway
 from normalization import normalize
+from profiles import ProfileRegistry
 from state import AgentState
 
 def item(i,payload,source="apollo",batch="batch-a"):
@@ -66,6 +67,32 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(n.contact["qualification_status"],"to_enrich")
         self.assertIn("missing_email",n.reasons)
         self.assertEqual(n.organization["display_name"],"Garage Martin")
+
+    def test_provider_profile_maps_nonstandard_fields(self):
+        profile={
+            "source_key":"weird-provider",
+            "fields":{
+                "email":["person.contact.work"],
+                "first_name":["person.identity.given"],
+                "last_name":["person.identity.family"],
+                "company_name":["account.label"],
+                "company_domain":["account.webhost"]
+            },
+            "vo_terms":["preowned-unit"]
+        }
+        n=normalize({
+            "person":{
+                "contact":{"work":"X@DEALER.FR"},
+                "identity":{"given":"alice","family":"martin"}
+            },
+            "account":{"label":"Dealer Test","webhost":"dealer.fr"},
+            "segment":"preowned-unit"
+        },"weird-provider",profile)
+        self.assertEqual(n.email["value"],"x@dealer.fr")
+        self.assertEqual(n.contact["first_name"],"Alice")
+        self.assertEqual(n.contact["last_name"],"MARTIN")
+        self.assertEqual(n.organization["display_name"],"Dealer Test")
+        self.assertEqual(n.contact["vo_relevance"],"confirmed")
 
     def test_production_promotes_and_acks(self):
         raw=MemoryRawGateway([item(1,{
