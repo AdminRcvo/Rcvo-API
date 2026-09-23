@@ -60,7 +60,7 @@ jobs:
         run: |
           git fetch origin main
           git diff --name-only origin/main...HEAD > /tmp/changed.txt
-          unexpected="$(grep -Ev '^(.github/workflows/(prospection-data-ci|reference-data-ci|sourcing-agent-ci|candidate-data-pipeline-ci).yml|prospection-data/|reference-data/|sourcing-agent/|integration-tests/)' /tmp/changed.txt || true)"
+          unexpected="$(grep -Ev '^(.github/workflows/(prospection-data-ci|reference-data-ci|sourcing-agent-ci|candidate-data-pipeline-ci).yml|prospection-data/|reference-data/|sourcing-agent/|prospecting-agent/|integration-tests/)' /tmp/changed.txt || true)"
           if [ -n "$unexpected" ]; then
             echo "Unexpected Rcvo application files changed:"
             echo "$unexpected"
@@ -69,7 +69,7 @@ jobs:
 
       - name: Basic committed-secret guard
         run: |
-          if git grep -nE '(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|BEGIN (RSA |OPENSSH )?PRIVATE KEY)' --             prospection-data reference-data sourcing-agent integration-tests; then
+          if git grep -nE '(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|BEGIN (RSA |OPENSSH )?PRIVATE KEY)' --             prospection-data reference-data sourcing-agent prospecting-agent integration-tests; then
             echo "Potential committed secret detected"
             exit 1
           fi
