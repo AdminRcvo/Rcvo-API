@@ -45,3 +45,5 @@ class ReferenceHttpGateway:
         })
     def events(self,events): return self._request("/v1/prospecting/events/batch",{"events":events})
     def suppress(self,payload): return self._request("/v1/prospecting/suppress",payload)
+    def dashboard(self):
+        return self._request("/v1/prospecting/dashboard",None,method="GET")
