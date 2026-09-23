@@ -110,7 +110,7 @@ class FoundationTests(unittest.TestCase):
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute(
                     "INSERT INTO contact_emails(contact_id,email_raw,email_norm) VALUES (?,?,?)",
-                    (b, "SAME@GARAGE.FR", "same@garage.fr"),
+                    (b, "SAME@GARAGE.FR", "SAME@GARAGE.FR"),
                 )
 
 if __name__ == "__main__":
