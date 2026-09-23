@@ -77,6 +77,17 @@ CREATE TABLE IF NOT EXISTS local_suppressions(
     UNIQUE(contact_rcvo_id,reason)
 );
 
+CREATE TABLE IF NOT EXISTS control_state(
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    outbound_state TEXT NOT NULL DEFAULT 'off'
+      CHECK(outbound_state IN ('off','paused','on')),
+    mode TEXT NOT NULL DEFAULT 'production'
+      CHECK(mode IN ('simulation','pilot','production')),
+    updated_at TEXT NOT NULL
+);
+INSERT OR IGNORE INTO control_state(id,outbound_state,mode,updated_at)
+VALUES (1,'off','production',strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+
 CREATE TABLE IF NOT EXISTS agent_runs(
     id INTEGER PRIMARY KEY,
     run_uuid TEXT NOT NULL UNIQUE,
@@ -233,6 +244,52 @@ class State:
         with self.connect() as c:
             row=c.execute("SELECT * FROM outbox WHERE message_id=? OR provider_message_id=?",(message_id,message_id)).fetchone()
             return dict(row) if row else None
+
+
+    def control(self):
+        with self.connect() as c:
+            row=c.execute("SELECT outbound_state,mode,updated_at FROM control_state WHERE id=1").fetchone()
+            return dict(row)
+
+    def set_control(self,outbound_state:str|None=None,mode:str|None=None):
+        if outbound_state is not None and outbound_state not in ("off","paused","on"):
+            raise ValueError("invalid outbound_state")
+        if mode is not None and mode not in ("simulation","pilot","production"):
+            raise ValueError("invalid mode")
+        current=self.control()
+        new_state=outbound_state or current["outbound_state"]
+        new_mode=mode or current["mode"]
+        with self.connect() as c:
+            c.execute(
+                "UPDATE control_state SET outbound_state=?,mode=?,updated_at=? WHERE id=1",
+                (new_state,new_mode,now())
+            )
+        return self.control()
+
+    def admin_snapshot(self):
+        control=self.control()
+        rows=[]
+        for row in self.mailbox_rows():
+            hourly,daily,_,last=self.sent_counts(row["mailbox_id"],None)
+            health=self.health_counts(row["mailbox_id"])
+            cfg=json.loads(row["config_json"])
+            rows.append({
+                "mailbox_id":row["mailbox_id"],
+                "address":row["address"],
+                "status":row["status"],
+                "pause_reason":row["pause_reason"],
+                "last_sent_at":last,
+                "sent_last_hour":hourly,
+                "sent_last_24h":daily,
+                "health_7d":health,
+                "daily_cap":int(cfg.get("daily_cap",0)),
+                "hourly_cap":int(cfg.get("hourly_cap",0)),
+            })
+        return {
+            "control":control,
+            "local":self.stats(),
+            "mailboxes":rows,
+        }
 
     def stats(self):
         with self.connect() as c:
