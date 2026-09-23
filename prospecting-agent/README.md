@@ -76,3 +76,19 @@ Environnement séparé avec :
 Le fichier d'exemple contient volontairement des valeurs à remplacer : domaine SMTP réel, sélecteur DKIM, adresse postale/identité complète, URL publique de l'Agent et URL finale de la vidéo.
 
 La première activation doit se faire en petits volumes, puis augmenter uniquement si les indicateurs de délivrabilité restent sains.
+
+
+## Capacité d'envoi candidate
+
+Le chiffre de 25 messages/jour n'est pas un plafond Rcvo. La candidate utilise
+désormais une montée en charge progressive par boîte jusqu'à **200 messages/jour**
+dans la configuration d'exemple, uniquement si la boîte reste saine.
+
+La rampe d'exemple est :
+`10 -> 15 -> 25 -> 40 -> 60 -> 80 -> 100 -> 120 -> 140 -> 160 -> 180 -> 200`.
+
+Ce plafond est un paramètre Rcvo, pas une garantie de délivrabilité ni une limite
+imposée par Gmail/Yahoo/Outlook. Les garde-fous réputationnels peuvent arrêter
+ou ralentir la boîte avant ce niveau. Le volume global augmente en ajoutant des
+boîtes authentifiées et saines, sans augmenter artificiellement la pression sur
+un même domaine destinataire.
