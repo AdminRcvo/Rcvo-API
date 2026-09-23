@@ -7,6 +7,7 @@ on:
     paths:
       - "prospecting-agent/**"
       - "reference-data/**"
+      - "integration-tests/**"
       - ".github/workflows/prospecting-agent-ci.yml"
   pull_request:
     paths:
