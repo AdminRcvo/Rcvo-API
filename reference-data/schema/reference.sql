@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     value TEXT NOT NULL
 ) WITHOUT ROWID;
 
-INSERT INTO schema_meta(key,value) VALUES ('schema_version','2')
+INSERT INTO schema_meta(key,value) VALUES ('schema_version','1')
 ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 CREATE TABLE IF NOT EXISTS organizations (
@@ -350,25 +350,6 @@ CREATE TABLE IF NOT EXISTS campaigns (
     updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS campaign_steps (
-    id INTEGER PRIMARY KEY,
-    campaign_id INTEGER NOT NULL REFERENCES campaigns(id),
-    step_number INTEGER NOT NULL CHECK(step_number >= 1),
-    delay_hours INTEGER NOT NULL DEFAULT 0 CHECK(delay_hours >= 0),
-    message_key TEXT NOT NULL,
-    subject_template TEXT NOT NULL,
-    text_template TEXT NOT NULL,
-    html_template TEXT,
-    video_url TEXT,
-    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE(campaign_id,step_number),
-    UNIQUE(campaign_id,message_key)
-);
-CREATE INDEX IF NOT EXISTS idx_campaign_steps_campaign
-    ON campaign_steps(campaign_id,step_number);
-
 CREATE TABLE IF NOT EXISTS campaign_contacts (
     id INTEGER PRIMARY KEY,
     campaign_id INTEGER NOT NULL REFERENCES campaigns(id),
@@ -387,30 +368,6 @@ CREATE TABLE IF NOT EXISTS campaign_contacts (
 );
 CREATE INDEX IF NOT EXISTS idx_campaign_contacts_status
     ON campaign_contacts(campaign_id,status,next_eligible_at);
-
-CREATE TABLE IF NOT EXISTS prospecting_dispatches (
-    id INTEGER PRIMARY KEY,
-    dispatch_uuid TEXT NOT NULL UNIQUE,
-    campaign_contact_id INTEGER NOT NULL REFERENCES campaign_contacts(id),
-    step_id INTEGER NOT NULL REFERENCES campaign_steps(id),
-    due_at TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending'
-        CHECK(status IN ('pending','leased','sent','deferred','skipped','failed','cancelled')),
-    attempts INTEGER NOT NULL DEFAULT 0,
-    lease_worker TEXT,
-    lease_until TEXT,
-    sender_mailbox TEXT,
-    provider_message_id TEXT,
-    last_error TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    sent_at TEXT,
-    UNIQUE(campaign_contact_id,step_id)
-);
-CREATE INDEX IF NOT EXISTS idx_dispatch_due
-    ON prospecting_dispatches(status,due_at,lease_until);
-CREATE INDEX IF NOT EXISTS idx_dispatch_contact
-    ON prospecting_dispatches(campaign_contact_id,status);
 
 CREATE TABLE IF NOT EXISTS prospecting_events (
     id INTEGER PRIMARY KEY,
