@@ -11,10 +11,16 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 REF_ROOT=ROOT/"reference-data"
 AGENT_ROOT=ROOT/"prospecting-agent"
-for p in (REF_ROOT/"src",AGENT_ROOT/"src"):
-    sys.path.insert(0,str(p))
-
+sys.path.insert(0,str(REF_ROOT/"src"))
 from reference_engine import connect,promote
+
+# The three-brick integration suite imports sourcing-agent modules with generic
+# names such as "agent" and "state". Remove those cached module names before
+# importing the independent prospecting-agent package in the same unittest process.
+for module_name in ("agent","state","contracts","deliverability","mailer","tokens","reference_gateway"):
+    sys.modules.pop(module_name,None)
+sys.path.insert(0,str(AGENT_ROOT/"src"))
+
 from agent import ProspectingAgent,RuntimeConfig
 from reference_gateway import ReferenceHttpGateway
 from state import State
