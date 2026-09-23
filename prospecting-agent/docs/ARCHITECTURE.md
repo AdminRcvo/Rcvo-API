@@ -33,7 +33,7 @@ Une séquence terminée impose un délai global de refroidissement avant qu'un c
 
 Les fournisseurs disposant de webhooks peuvent appeler `/events/provider`. Les événements sont d'abord persistés localement. Une plainte ou un hard bounce crée immédiatement une suppression locale avant synchronisation.
 
-Un adaptateur IMAP ou une API fournisseur spécifique pourra être ajouté ultérieurement au même contrat sans changer la Référence ni le moteur de campagne.
+Un scanner IMAP générique est déjà prévu pour les boîtes SMTP/IMAP classiques : il reconnaît les réponses liées par Message-ID et les DSN de non-remise. Les webhooks fournisseur restent supportés en parallèle. Un adaptateur API spécifique pourra être ajouté sans changer la Référence ni le moteur de campagne.
 
 ## Délivrabilité
 
