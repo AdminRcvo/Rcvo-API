@@ -325,14 +325,28 @@ def _organization(
         existing=conn.execute("SELECT organization_id FROM organization_domains WHERE domain_norm=?",(domain,)).fetchone()
         if existing and int(existing["organization_id"])!=org_id:
             raise ValueError(f"domain already belongs to another organization: {domain}")
+        wants_primary=org.get("is_primary_domain")
+        current_primary=conn.execute(
+            "SELECT id FROM organization_domains WHERE organization_id=? AND is_primary=1",
+            (org_id,),
+        ).fetchone()
+        if wants_primary is True:
+            conn.execute("UPDATE organization_domains SET is_primary=0 WHERE organization_id=?",(org_id,))
+            primary_domain=1
+        elif wants_primary is False:
+            primary_domain=0
+        else:
+            primary_domain=1 if current_primary is None else 0
         conn.execute(
             """
             INSERT INTO organization_domains(
                 organization_id,domain_raw,domain_norm,is_primary,first_seen_at,last_seen_at
             ) VALUES (?,?,?,?,?,?)
-            ON CONFLICT(domain_norm) DO UPDATE SET last_seen_at=excluded.last_seen_at
+            ON CONFLICT(domain_norm) DO UPDATE SET
+                last_seen_at=excluded.last_seen_at,
+                is_primary=CASE WHEN excluded.is_primary=1 THEN 1 ELSE organization_domains.is_primary END
             """,
-            (org_id,str(org.get("domain") or org.get("website_domain")),domain,1,now,now),
+            (org_id,str(org.get("domain") or org.get("website_domain")),domain,primary_domain,now,now),
         )
     _link_external(conn,raw,"organization",external_id,organization_id=org_id)
 
@@ -590,7 +604,17 @@ def _email(
         )
         _event(conn,raw,"email_reused",contact_id=contact_id,details={"email":normalized})
     else:
-        primary=1 if email.get("is_primary",True) else 0
+        requested_primary=email.get("is_primary")
+        current_primary=conn.execute(
+            "SELECT id FROM contact_emails WHERE contact_id=? AND is_primary=1",
+            (contact_id,),
+        ).fetchone()
+        if requested_primary is True:
+            primary=1
+        elif requested_primary is False:
+            primary=0
+        else:
+            primary=1 if current_primary is None else 0
         if primary:
             conn.execute("UPDATE contact_emails SET is_primary=0 WHERE contact_id=?",(contact_id,))
         cur=conn.execute(

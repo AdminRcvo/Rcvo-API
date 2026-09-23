@@ -432,7 +432,13 @@ LEFT JOIN contact_emails ce
 LEFT JOIN contact_phones cp
     ON cp.contact_id=c.id AND cp.is_primary=1
 LEFT JOIN contact_employments e
-    ON e.contact_id=c.id AND e.is_current=1
+    ON e.id=(
+        SELECT e2.id
+        FROM contact_employments e2
+        WHERE e2.contact_id=c.id AND e2.is_current=1
+        ORDER BY e2.confidence DESC,e2.last_seen_at DESC,e2.id DESC
+        LIMIT 1
+    )
 LEFT JOIN organizations o
     ON o.id=e.organization_id
 LEFT JOIN organization_sites s

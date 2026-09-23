@@ -280,6 +280,83 @@ class ReferenceTests(unittest.TestCase):
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute("DELETE FROM match_decisions WHERE id=?",(decision,))
 
+
+    def test_multiple_emails_keep_single_primary_by_default(self):
+        first=promote(self.db,payload(1,email="primary@dealer.fr"))
+        second_payload=payload(2,email="alternate@dealer.fr")
+        second_payload["contact_match_rcvo_id"]=first["contact_rcvo_id"]
+        promote(self.db,second_payload)
+        with connect(self.db) as conn:
+            rows=conn.execute(
+                "SELECT email_norm,is_primary FROM contact_emails ORDER BY id"
+            ).fetchall()
+        self.assertEqual(len(rows),2)
+        self.assertEqual(sum(int(r["is_primary"]) for r in rows),1)
+        self.assertEqual(rows[0]["email_norm"],"primary@dealer.fr")
+        self.assertEqual(rows[0]["is_primary"],1)
+
+    def test_multiple_domains_keep_single_primary_by_default(self):
+        first=promote(
+            self.db,
+            payload(
+                1,
+                organization={
+                    "display_name":"Groupe X",
+                    "domain":"groupe-x.fr",
+                    "confidence":0.9,
+                },
+            ),
+        )
+        second_payload=payload(
+            2,
+            email="autre@dealer.fr",
+            organization={
+                "display_name":"Groupe X",
+                "domain":"groupe-x-vo.fr",
+                "confidence":0.9,
+            },
+        )
+        second_payload["organization_match_rcvo_id"]=first["organization_rcvo_id"]
+        promote(self.db,second_payload)
+        with connect(self.db) as conn:
+            rows=conn.execute(
+                "SELECT domain_norm,is_primary FROM organization_domains ORDER BY id"
+            ).fetchall()
+        self.assertEqual(len(rows),2)
+        self.assertEqual(sum(int(r["is_primary"]) for r in rows),1)
+        self.assertEqual(rows[0]["domain_norm"],"groupe-x.fr")
+        self.assertEqual(rows[0]["is_primary"],1)
+
+    def test_master_view_stays_one_row_with_multiple_current_jobs(self):
+        first=promote(
+            self.db,
+            payload(
+                1,
+                organization={"display_name":"Groupe A","domain":"groupe-a.fr","confidence":0.9},
+                employment={"job_title":"Directeur commercial","job_role":"direction","is_current":True,"confidence":0.7},
+            ),
+        )
+        second_payload=payload(
+            2,
+            email="direction@dealer.fr",
+            organization={"display_name":"Concession B","domain":"concession-b.fr","confidence":0.9},
+            employment={"job_title":"Responsable VO","job_role":"responsable_vo","is_current":True,"confidence":0.95},
+        )
+        second_payload["contact_match_rcvo_id"]=first["contact_rcvo_id"]
+        promote(self.db,second_payload)
+        with connect(self.db) as conn:
+            master=conn.execute(
+                "SELECT * FROM v_contact_master WHERE rcvo_id=?",
+                (first["contact_rcvo_id"],),
+            ).fetchall()
+            prospectable=conn.execute(
+                "SELECT * FROM v_prospectable_contacts WHERE rcvo_id=?",
+                (first["contact_rcvo_id"],),
+            ).fetchall()
+        self.assertEqual(len(master),1)
+        self.assertEqual(len(prospectable),1)
+        self.assertEqual(master[0]["job_role"],"responsable_vo")
+
     def test_integrity_and_stats(self):
         promote(self.db,payload(1))
         with connect(self.db) as conn:

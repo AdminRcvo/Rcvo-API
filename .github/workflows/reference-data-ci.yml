@@ -28,6 +28,8 @@ jobs:
           python-version: "3.12"
       - name: Unit and integrity tests
         run: python -m unittest discover -s tests -v
+      - name: Reference promotion benchmark
+        run: python scripts/benchmark_reference.py --rows 2000
       - name: CLI smoke test
         run: |
           python src/reference_cli.py --db /tmp/rcvo-reference.sqlite init
