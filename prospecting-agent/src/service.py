@@ -41,6 +41,7 @@ def build_agent(args):
 class Server(ThreadingHTTPServer):
     agent:ProspectingAgent
     feedback_token:str
+    admin_token:str
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,fmt,*args): return
@@ -56,8 +57,36 @@ class Handler(BaseHTTPRequestHandler):
         if "json" in ctype: return json.loads(raw.decode() or "{}")
         return {"raw":raw.decode(errors="replace")}
 
+    def _admin_auth(self):
+        return bool(
+            self.server.admin_token
+            and self.headers.get("Authorization")=="Bearer "+self.server.admin_token
+        )
+
+    def _admin_dashboard(self):
+        return {
+            "agent":self.server.agent.state.admin_snapshot(),
+            "reference":self.server.agent.reference.dashboard(),
+            "health":{
+                "reference":self.server.agent.reference.health(),
+            },
+        }
+
     def do_GET(self):
         path=urlparse(self.path).path
+        if path=="/v1/admin/prospecting/dashboard":
+            if not self._admin_auth():
+                self._json(401,{"error":"unauthorized"}); return
+            try:
+                self._json(200,self._admin_dashboard())
+            except Exception as exc:
+                self._json(503,{"error":"dashboard_unavailable","message":str(exc)})
+            return
+        if path=="/v1/admin/prospecting/control":
+            if not self._admin_auth():
+                self._json(401,{"error":"unauthorized"}); return
+            self._json(200,self.server.agent.state.control())
+            return
         if path in ("/health","/ready"):
             try:
                 data={"status":"ok","reference":self.server.agent.reference.health(),"state":self.server.agent.state.stats()}
@@ -105,6 +134,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path=urlparse(self.path).path
+        if path=="/v1/admin/prospecting/control":
+            if not self._admin_auth():
+                self._json(401,{"error":"unauthorized"}); return
+            try:
+                body=self._body()
+                action=str(body.get("action") or "").strip().lower()
+                mode=body.get("mode")
+                mapping={"start":"on","on":"on","pause":"paused","paused":"paused","stop":"off","off":"off"}
+                if action not in mapping:
+                    raise ValueError("action must be start, pause or stop")
+                state=self.server.agent.state.set_control(mapping[action],mode)
+                self._json(200,state)
+            except Exception as exc:
+                self._json(400,{"error":"bad_request","message":str(exc)})
+            return
         if path.startswith("/unsubscribe/"):
             token=path.rsplit("/",1)[1]
             try:
@@ -173,8 +217,13 @@ def main():
     agent=build_agent(args)
     agent.bootstrap()
     feedback=os.getenv("RCVO_PROSPECTING_FEEDBACK_TOKEN")
-    if not feedback: raise SystemExit("RCVO_PROSPECTING_FEEDBACK_TOKEN is required")
-    server=Server((args.bind,args.port),Handler); server.agent=agent; server.feedback_token=feedback
+    admin_token=os.getenv("RCVO_PROSPECTING_ADMIN_TOKEN")
+    if not feedback or not admin_token:
+        raise SystemExit("RCVO_PROSPECTING_FEEDBACK_TOKEN and RCVO_PROSPECTING_ADMIN_TOKEN are required")
+    server=Server((args.bind,args.port),Handler)
+    server.agent=agent
+    server.feedback_token=feedback
+    server.admin_token=admin_token
     thread=threading.Thread(target=server.serve_forever,daemon=True); thread.start()
     while True:
         try:
