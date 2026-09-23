@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS contact_emails (
     id INTEGER PRIMARY KEY,
     contact_id INTEGER NOT NULL REFERENCES contacts(id),
     email_raw TEXT NOT NULL,
-    email_norm TEXT NOT NULL UNIQUE,
+    email_norm TEXT NOT NULL COLLATE NOCASE UNIQUE,
     email_kind TEXT NOT NULL DEFAULT 'unknown'
         CHECK(email_kind IN ('personal_business','generic_business','unknown')),
     deliverability_status TEXT NOT NULL DEFAULT 'unknown'
@@ -258,7 +258,7 @@ CREATE TABLE IF NOT EXISTS suppressions (
     ends_at TEXT,
     source TEXT,
     notes TEXT,
-    UNIQUE(scope_type, scope_value, reason, active)
+    UNIQUE(scope_type, scope_value, reason)
 );
 
 CREATE INDEX IF NOT EXISTS idx_suppressions_active
