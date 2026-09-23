@@ -39,6 +39,8 @@ jobs:
       - name: Prospecting Agent tests
         working-directory: prospecting-agent
         run: python -m unittest discover -s tests -v
+      - name: Real Reference to Prospecting Agent integration test
+        run: python -m unittest integration-tests.test_prospecting_e2e -v
       - name: Build Prospecting Agent image
         run: docker build -t rcvo-prospecting-agent-candidate prospecting-agent
       - name: Candidate isolation
