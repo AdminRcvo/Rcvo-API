@@ -1,0 +1,36 @@
+name: Rcvo Reference Data CI
+
+on:
+  push:
+    branches:
+      - "foundation/rcvo-prospection-data-v1"
+    paths:
+      - "reference-data/**"
+      - ".github/workflows/reference-data-ci.yml"
+  pull_request:
+    paths:
+      - "reference-data/**"
+      - ".github/workflows/reference-data-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  reference-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: reference-data
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Unit and integrity tests
+        run: python -m unittest discover -s tests -v
+      - name: CLI smoke test
+        run: |
+          python src/reference_cli.py --db /tmp/rcvo-reference.sqlite init
+          python src/reference_cli.py --db /tmp/rcvo-reference.sqlite promote --file examples/sourcing-promotion.json
+          python src/reference_cli.py --db /tmp/rcvo-reference.sqlite check
+          python src/reference_cli.py --db /tmp/rcvo-reference.sqlite stats

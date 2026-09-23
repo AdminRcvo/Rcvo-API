@@ -1,0 +1,37 @@
+{
+  "raw_ref": {
+    "source_key": "apollo",
+    "raw_batch_uuid": "batch-2026-10-01",
+    "raw_record_id": 12345,
+    "source_record_id": "apollo-987654"
+  },
+  "contact": {
+    "external_id": "apollo-987654",
+    "last_name": "DUPONT",
+    "first_name": "Jean",
+    "city": "Bordeaux",
+    "qualification_status": "usable",
+    "vo_relevance": "confirmed",
+    "confidence": 0.92
+  },
+  "email": {
+    "value": "jean.dupont@garage-x.fr",
+    "kind": "personal_business",
+    "deliverability_status": "valid",
+    "confidence": 0.98
+  },
+  "organization": {
+    "external_id": "apollo-company-321",
+    "display_name": "Garage X",
+    "domain": "garage-x.fr",
+    "city": "Bordeaux",
+    "vo_relevance": "confirmed",
+    "confidence": 0.95
+  },
+  "employment": {
+    "job_title": "Responsable VO",
+    "job_role": "responsable_vo",
+    "is_current": true,
+    "confidence": 0.9
+  }
+}
