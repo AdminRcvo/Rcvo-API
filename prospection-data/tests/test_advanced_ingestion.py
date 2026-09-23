@@ -31,6 +31,30 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+    def do_POST(self):
+        if self.headers.get("Authorization") != "Bearer test-token":
+            self.send_response(401)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length) or b"{}")
+        cursor = payload.get("cursor")
+        if cursor is None:
+            contacts = [{"id": "p1"}, {"id": "p2"}]
+            next_cursor = "cursor-2"
+        elif cursor == "cursor-2":
+            contacts = [{"id": "p3"}]
+            next_cursor = None
+        else:
+            contacts = []
+            next_cursor = None
+        body = json.dumps({"results": contacts, "meta": {"next_cursor": next_cursor}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, fmt, *args):
         return
 
@@ -63,6 +87,25 @@ class AdvancedIngestionTests(unittest.TestCase):
         with gzip.open(path, "wt", encoding="utf-8") as fh:
             fh.write("email;entreprise;ville\na@x.fr;Garage X;Dax\nb@y.fr;Garage Y;Pau\n")
         result = ingest_file(self.data, path, source_key="gzip-csv")
+        self.assertEqual(result["rows"], 2)
+
+    def test_zip_and_xml_formats(self):
+        archive = self.root / "mixed.zip"
+        with zipfile.ZipFile(archive, "w") as z:
+            z.writestr("contacts.csv", "email;ville\na@x.fr;Dax\n")
+            z.writestr("contacts.jsonl", '{"email":"b@y.fr","ville":"Pau"}\n')
+        result = ingest_file(self.data, archive, source_key="zip-test")
+        self.assertEqual(result["rows"], 2)
+
+        xml = self.root / "contacts.xml"
+        xml.write_text(
+            "<contacts><contact><email>a@x.fr</email><ville>Dax</ville></contact>"
+            "<contact><email>b@y.fr</email><ville>Pau</ville></contact></contacts>",
+            encoding="utf-8",
+        )
+        result = ingest_file(
+            self.data, xml, source_key="xml-test", xml_record_tag="contact"
+        )
         self.assertEqual(result["rows"], 2)
 
     def test_xlsx(self):
@@ -123,6 +166,41 @@ class AdvancedIngestionTests(unittest.TestCase):
             self.assertEqual(artifacts, 2)
             self.assertEqual(fetches, 1)
         finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_http_post_cursor_and_bearer_env(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ApiHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        old = os.environ.get("RCVO_TEST_TOKEN")
+        os.environ["RCVO_TEST_TOKEN"] = "test-token"
+        try:
+            config = {
+                "source_key": "http-post-test",
+                "connector_key": "cursor",
+                "url": f"http://127.0.0.1:{server.server_port}/search",
+                "method": "POST",
+                "auth": {"type": "bearer_env", "env": "RCVO_TEST_TOKEN"},
+                "json_body": {"market": "vo"},
+                "response": {"format": "json", "records_path": "results"},
+                "pagination": {
+                    "type": "cursor",
+                    "target": "json_body",
+                    "cursor_param": "cursor",
+                    "next_cursor_path": "meta.next_cursor"
+                },
+                "retry": {"max_attempts": 2, "backoff_seconds": 0.01}
+            }
+            result = run_http_connector(self.data, config, restart=True)
+            self.assertEqual(result["rows"], 3)
+            self.assertEqual(result["requests"], 2)
+            self.assertTrue(result["checkpoint"]["complete"])
+        finally:
+            if old is None:
+                os.environ.pop("RCVO_TEST_TOKEN", None)
+            else:
+                os.environ["RCVO_TEST_TOKEN"] = old
             server.shutdown()
             server.server_close()
 

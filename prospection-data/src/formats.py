@@ -84,23 +84,35 @@ def _prepend(first: str, iterator):
 
 def _iter_csv(binary: BinaryIO, name: str, delimiter: str | None) -> Iterator[ParsedRecord]:
     text = io.TextIOWrapper(binary, encoding="utf-8-sig", errors="replace", newline="")
-    header = text.readline()
-    if not header:
-        return
-    reader = csv.DictReader(_prepend(header, text), delimiter=_delimiter(name, header, delimiter))
-    for line_no, row in enumerate(reader, start=2):
-        yield ParsedRecord(dict(row), f"{name}:row:{line_no}")
+    try:
+        header = text.readline()
+        if not header:
+            return
+        reader = csv.DictReader(_prepend(header, text), delimiter=_delimiter(name, header, delimiter))
+        for line_no, row in enumerate(reader, start=2):
+            yield ParsedRecord(dict(row), f"{name}:row:{line_no}")
+    finally:
+        try:
+            text.detach()
+        except Exception:
+            pass
 
 def _iter_jsonl(binary: BinaryIO, name: str) -> Iterator[ParsedRecord]:
     text = io.TextIOWrapper(binary, encoding="utf-8-sig", errors="replace")
-    for line_no, line in enumerate(text, start=1):
-        raw = line.strip()
-        if not raw:
-            continue
+    try:
+        for line_no, line in enumerate(text, start=1):
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                yield ParsedRecord(json.loads(raw), f"{name}:line:{line_no}")
+            except Exception as exc:
+                yield ParsedRecord(None, f"{name}:line:{line_no}", raw[:65536], str(exc))
+    finally:
         try:
-            yield ParsedRecord(json.loads(raw), f"{name}:line:{line_no}")
-        except Exception as exc:
-            yield ParsedRecord(None, f"{name}:line:{line_no}", raw[:65536], str(exc))
+            text.detach()
+        except Exception:
+            pass
 
 def _path_get(data: Any, path: str | None) -> Any:
     if not path:
@@ -145,7 +157,14 @@ def _iter_json(binary: BinaryIO, name: str, records_path: str | None) -> Iterato
             except Exception:
                 return
     try:
-        data = json.load(io.TextIOWrapper(binary, encoding="utf-8-sig", errors="replace"))
+        text = io.TextIOWrapper(binary, encoding="utf-8-sig", errors="replace")
+        try:
+            data = json.load(text)
+        finally:
+            try:
+                text.detach()
+            except Exception:
+                pass
         records = _path_get(data, records_path)
         if isinstance(records, list):
             for index, item in enumerate(records, start=1):
