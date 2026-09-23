@@ -1,0 +1,113 @@
+name: Rcvo Data Pipeline Candidate Certification
+
+on:
+  push:
+    branches:
+      - "foundation/rcvo-prospection-data-v1"
+    paths:
+      - "prospection-data/**"
+      - "reference-data/**"
+      - "sourcing-agent/**"
+      - "integration-tests/**"
+      - ".github/workflows/candidate-data-pipeline-ci.yml"
+  pull_request:
+    paths:
+      - "prospection-data/**"
+      - "reference-data/**"
+      - "sourcing-agent/**"
+      - "integration-tests/**"
+      - ".github/workflows/candidate-data-pipeline-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  certify-three-brick-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install RAW ingestion dependencies
+        run: python -m pip install -r prospection-data/requirements-ingestion.txt
+
+      - name: Compile all candidate Python
+        run: |
+          python -m compileall -q prospection-data/src prospection-data/scripts
+          python -m compileall -q reference-data/src reference-data/scripts
+          python -m compileall -q sourcing-agent/src
+
+      - name: RAW unit tests
+        working-directory: prospection-data
+        run: python -m unittest discover -s tests -v
+
+      - name: Reference unit tests
+        working-directory: reference-data
+        run: python -m unittest discover -s tests -v
+
+      - name: Sourcing Agent unit tests
+        working-directory: sourcing-agent
+        run: python -m unittest discover -s tests -v
+
+      - name: Real end-to-end three-brick tests
+        run: python -m unittest discover -s integration-tests -v
+
+      - name: Verify candidate isolation from Rcvo application
+        run: |
+          git fetch origin main
+          git diff --name-only origin/main...HEAD > /tmp/changed.txt
+          unexpected="$(grep -Ev '^(.github/workflows/(prospection-data-ci|reference-data-ci|sourcing-agent-ci|candidate-data-pipeline-ci).yml|prospection-data/|reference-data/|sourcing-agent/|integration-tests/)' /tmp/changed.txt || true)"
+          if [ -n "$unexpected" ]; then
+            echo "Unexpected Rcvo application files changed:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+      - name: Basic committed-secret guard
+        run: |
+          if git grep -nE '(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|BEGIN (RSA |OPENSSH )?PRIVATE KEY)' --             prospection-data reference-data sourcing-agent integration-tests; then
+            echo "Potential committed secret detected"
+            exit 1
+          fi
+
+      - name: Build three autonomous images
+        run: |
+          docker build -t rcvo-raw-candidate prospection-data
+          docker build -t rcvo-reference-candidate reference-data
+          docker build -t rcvo-sourcing-agent-candidate sourcing-agent
+
+      - name: Docker interconnection smoke test
+        run: |
+          set -euo pipefail
+          cleanup() {
+            docker rm -f rcvo-raw-smoke rcvo-reference-smoke rcvo-sourcing-smoke >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker run -d --name rcvo-raw-smoke             -e RCVO_RAW_SOURCING_TOKEN=raw-smoke-token             -p 18091:8080 rcvo-raw-candidate
+          docker run -d --name rcvo-reference-smoke             -e RCVO_REFERENCE_SOURCING_TOKEN=ref-smoke-token             -p 18092:8080 rcvo-reference-candidate
+
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:18091/health >/dev/null &&             curl -fsS http://127.0.0.1:18092/health >/dev/null && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18091/health
+          curl -fsS http://127.0.0.1:18092/health
+
+          docker run -d --name rcvo-sourcing-smoke --network host             -e RCVO_RAW_BASE_URL=http://127.0.0.1:18091             -e RCVO_REFERENCE_BASE_URL=http://127.0.0.1:18092             -e RCVO_RAW_SOURCING_TOKEN=raw-smoke-token             -e RCVO_REFERENCE_SOURCING_TOKEN=ref-smoke-token             -e RCVO_SOURCING_MODE=simulation             -e PORT=18093             rcvo-sourcing-agent-candidate
+
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:18093/health >/tmp/sourcing-health.json && break
+            sleep 1
+          done
+          cat /tmp/sourcing-health.json
+          python - <<'PY'
+          import json
+          data=json.load(open("/tmp/sourcing-health.json"))
+          assert data["status"]=="ok", data
+          assert data["raw"]["status"]=="ok", data
+          assert data["reference"]["status"]=="ok", data
+          PY
