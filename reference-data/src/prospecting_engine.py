@@ -497,3 +497,59 @@ def suppress(path:Path,payload:dict[str,Any]) -> dict[str,Any]:
                 (contact["id"],),
             )
         return {"suppressed":True,"email":email_value}
+
+
+def dashboard_metrics(path:Path) -> dict[str,Any]:
+    init_db(path)
+    with connect(path) as conn:
+        event_counts={
+            row["event_type"]:int(row["n"])
+            for row in conn.execute(
+                "SELECT event_type,count(*) AS n FROM prospecting_events GROUP BY event_type"
+            )
+        }
+        campaign_counts={
+            row["status"]:int(row["n"])
+            for row in conn.execute(
+                "SELECT status,count(*) AS n FROM campaigns GROUP BY status"
+            )
+        }
+        total_contacts=int(conn.execute("SELECT count(*) FROM contacts").fetchone()[0])
+        active_contacts=int(conn.execute(
+            "SELECT count(*) FROM contacts WHERE status='active'"
+        ).fetchone()[0])
+        prospectable=int(conn.execute(
+            "SELECT count(*) FROM v_prospectable_contacts"
+        ).fetchone()[0])
+        suppressions=int(conn.execute(
+            "SELECT count(*) FROM suppressions WHERE active=1"
+        ).fetchone()[0])
+        enrolled=int(conn.execute(
+            "SELECT count(*) FROM campaign_contacts"
+        ).fetchone()[0])
+        emails_sent=event_counts.get("email_sent",0)+event_counts.get("followup_sent",0)
+        return {
+            "contacts":{
+                "total":total_contacts,
+                "active":active_contacts,
+                "prospectable":prospectable,
+                "suppressed":suppressions,
+                "campaign_enrollments":enrolled,
+            },
+            "prospecting":{
+                "emails_sent":emails_sent,
+                "initial_emails_sent":event_counts.get("email_sent",0),
+                "followups_sent":event_counts.get("followup_sent",0),
+                "video_views":event_counts.get("video_viewed",0),
+                "replies":event_counts.get("reply_received",0),
+                "delivered":event_counts.get("email_delivered",0),
+                "soft_bounces":event_counts.get("soft_bounce",0),
+                "hard_bounces":event_counts.get("bounce",0),
+                "spam_complaints":event_counts.get("spam_complaint",0),
+                "unsubscribes":event_counts.get("unsubscribe_requested",0)+event_counts.get("optout",0),
+                "delivery_deferred":event_counts.get("delivery_deferred",0),
+                "delivery_rejected":event_counts.get("delivery_rejected",0),
+                "events_total":sum(event_counts.values()),
+            },
+            "campaigns":campaign_counts,
+        }
