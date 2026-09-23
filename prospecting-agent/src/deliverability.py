@@ -80,7 +80,7 @@ def health_gate(config:dict[str,Any],counts:dict[str,int])->Gate:
     return Gate(True)
 
 def effective_daily_cap(config:dict[str,Any],activated_at:str|None)->int:
-    base=int(config.get("daily_cap",25))
+    base=int(config.get("daily_cap",200))
     ramp=config.get("warmup_daily_caps") or []
     if not ramp or not activated_at:
         return base
@@ -89,11 +89,11 @@ def effective_daily_cap(config:dict[str,Any],activated_at:str|None)->int:
     return min(base,int(ramp[min(days,len(ramp)-1)]))
 
 def capacity_gate(config:dict[str,Any],hourly:int,daily:int,domain_hourly:int,last_sent_at:str|None,activated_at:str|None=None)->Gate:
-    if hourly>=int(config.get("hourly_cap",10)):
+    if hourly>=int(config.get("hourly_cap",30)):
         return Gate(False,"hourly_cap")
     if daily>=effective_daily_cap(config,activated_at):
         return Gate(False,"daily_cap")
-    if domain_hourly>=int(config.get("recipient_domain_hourly_cap",5)):
+    if domain_hourly>=int(config.get("recipient_domain_hourly_cap",8)):
         return Gate(False,"recipient_domain_hourly_cap")
     minimum=float(config.get("min_interval_seconds",90))
     if last_sent_at:
