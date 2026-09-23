@@ -7,7 +7,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/"src"))
 
 from agent import ProspectingAgent,RuntimeConfig
-from deliverability import Gate,health_gate
+from deliverability import Gate,effective_daily_cap,health_gate
 from inbound import classify
 from mailer import build_message
 from state import State
@@ -184,6 +184,13 @@ class ProspectingAgentTests(unittest.TestCase):
         bounce=classify(dsn)
         self.assertEqual(bounce["event_type"],"bounce")
         self.assertEqual(bounce["message_id"],"<abc@example.com>")
+
+    def test_adaptive_daily_cap_reaches_high_volume_after_warmup(self):
+        config={
+            "daily_cap":200,
+            "warmup_daily_caps":[10,15,25,40,60,80,100,120,140,160,180,200],
+        }
+        self.assertEqual(effective_daily_cap(config,"2020-01-01T00:00:00Z"),200)
 
     def test_complaint_health_gate_blocks(self):
         gate=health_gate({"pause_on_any_complaint":True},{"sent":1000,"spam_complaint":1})
