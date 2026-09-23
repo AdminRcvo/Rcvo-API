@@ -13,7 +13,7 @@ sys.path.insert(0,str(ROOT/"src"))
 
 from reference_engine import connect, init_db, norm_domain, norm_email, promote_many
 from prospecting_engine import (
-    claim_due, eligible_contacts, enroll_contacts, enroll_eligible,
+    claim_due, dashboard_metrics, eligible_contacts, enroll_contacts, enroll_eligible,
     record_events, register_message_version, release_claim, suppress, upsert_campaign
 )
 
@@ -139,6 +139,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._write(200,{"status":"ok" if check=="ok" else "degraded","quick_check":check})
             except Exception as exc:
                 self._write(503,{"status":"error","error":str(exc)})
+            return
+        if self.path=="/v1/prospecting/dashboard":
+            if not self._auth("prospecting"):
+                self._write(401,{"error":"unauthorized"})
+                return
+            self._write(200,dashboard_metrics(self.server.db))
             return
         self._write(404,{"error":"not_found"})
 
