@@ -1,0 +1,34 @@
+name: Rcvo Sourcing Agent CI
+
+on:
+  push:
+    branches:
+      - "foundation/rcvo-prospection-data-v1"
+    paths:
+      - "sourcing-agent/**"
+      - ".github/workflows/sourcing-agent-ci.yml"
+  pull_request:
+    paths:
+      - "sourcing-agent/**"
+      - ".github/workflows/sourcing-agent-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  sourcing-agent:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sourcing-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Agent benchmark 10k
+        run: python scripts/benchmark_agent.py --rows 10000
+      - name: Docker build
+        run: docker build -t rcvo-sourcing-agent-ci .

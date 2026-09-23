@@ -882,6 +882,7 @@ def promote_many(
     conn=connect(path)
     total=created=enriched=idempotent=failed=0
     errors=[]
+    results=[]
     in_batch=0
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -893,6 +894,7 @@ def promote_many(
                 raw=_prepare_raw(payload)
                 result=_promote_on_conn(conn,payload)
                 conn.execute("RELEASE SAVEPOINT rcvo_item")
+                results.append({"ok":True,**result})
                 if result.get("idempotent"):
                     idempotent+=1
                 elif result.get("status")=="created":
@@ -913,6 +915,7 @@ def promote_many(
                 except Exception:
                     pass
                 errors.append({"index":index,"error":str(exc)})
+                results.append({"ok":False,"error":str(exc)})
                 if not continue_on_error:
                     conn.rollback()
                     raise
@@ -929,6 +932,7 @@ def promote_many(
             "idempotent":idempotent,
             "failed":failed,
             "errors":errors[:100],
+            "results":results,
         }
     except Exception:
         try:

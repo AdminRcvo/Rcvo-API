@@ -1,0 +1,21 @@
+{
+  "source_key": "provider-key-here",
+  "fields": {
+    "email": ["person.contacts.work_email", "email"],
+    "first_name": ["person.first_name"],
+    "last_name": ["person.last_name"],
+    "phone": ["person.phone"],
+    "job_title": ["person.title"],
+    "job_role": ["person.role"],
+    "company_name": ["company.name"],
+    "company_domain": ["company.domain"],
+    "company_city": ["company.city"],
+    "postal_code": ["company.postal_code"],
+    "country": ["company.country_code"],
+    "external_contact_id": ["person.id"],
+    "external_company_id": ["company.id"]
+  },
+  "automotive_terms": ["dealer network"],
+  "vo_terms": ["used vehicle"],
+  "sales_terms": ["sales executive"]
+}

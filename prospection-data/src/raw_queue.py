@@ -29,9 +29,12 @@ def claim_records(
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
             """
-            SELECT r.id, r.batch_id, r.source_record_id, r.source_row_number,
+            SELECT r.id, r.batch_id, b.batch_uuid AS raw_batch_uuid,
+                   s.source_key, r.source_record_id, r.source_row_number,
                    r.captured_at, r.payload_json
             FROM raw_records r
+            JOIN raw_batches b ON b.id=r.batch_id
+            JOIN raw_sources s ON s.id=b.source_id
             LEFT JOIN raw_record_leases l ON l.raw_record_id=r.id
             WHERE r.processing_state IN ('pending','claimed')
               AND (l.raw_record_id IS NULL OR l.lease_until <= ?)
@@ -103,6 +106,24 @@ def extend_lease(
             "UPDATE raw_record_leases SET lease_until=? WHERE raw_record_id=?",
             (until, record_id),
         )
+
+def release_record(raw_path: Path, record_id: int, worker_id: str) -> None:
+    with connect_fast(raw_path) as conn:
+        _assert_owner(conn, record_id, worker_id)
+        conn.execute(
+            "UPDATE raw_records SET processing_state='pending' WHERE id=?",
+            (record_id,),
+        )
+        conn.execute(
+            """
+            UPDATE raw_record_attempts
+            SET attempts=CASE WHEN attempts>0 THEN attempts-1 ELSE 0 END,
+                updated_at=?
+            WHERE raw_record_id=?
+            """,
+            (_iso(datetime.now(timezone.utc)), record_id),
+        )
+        conn.execute("DELETE FROM raw_record_leases WHERE raw_record_id=?", (record_id,))
 
 def ack_record(raw_path: Path, record_id: int, worker_id: str) -> None:
     now = _iso(datetime.now(timezone.utc))
