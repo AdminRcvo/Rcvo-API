@@ -16,6 +16,7 @@ Il ne cherche pas de prospects et ne nettoie pas les données. Il orchestre la p
 - conserver une outbox locale transactionnelle pour empêcher un renvoi après succès SMTP + panne de la Référence ;
 - synchroniser l'historique complet dans la Référence ;
 - gérer relances, réponses, hard/soft bounces, plaintes spam et exclusions ;
+- surveiller les boîtes en IMAP lorsqu'il est activé afin de détecter les réponses et DSN même sans webhook fournisseur ;
 - exposer une landing page vidéo Rcvo et enregistrer les lectures volontaires ;
 - suspendre automatiquement une boîte lorsqu'un signal de santé devient mauvais.
 
