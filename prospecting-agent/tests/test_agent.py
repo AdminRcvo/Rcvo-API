@@ -102,6 +102,7 @@ class ProspectingAgentTests(unittest.TestCase):
             )
         )
         self.agent.bootstrap()
+        self.state.set_control("on","production")
     def tearDown(self): self.tmp.cleanup()
 
     def test_send_syncs_once_with_outbox(self):
@@ -184,6 +185,25 @@ class ProspectingAgentTests(unittest.TestCase):
         bounce=classify(dsn)
         self.assertEqual(bounce["event_type"],"bounce")
         self.assertEqual(bounce["message_id"],"<abc@example.com>")
+
+    def test_default_control_is_off(self):
+        fresh=State(Path(self.tmp.name)/"fresh-control.sqlite")
+        self.assertEqual(fresh.control()["outbound_state"],"off")
+        self.assertEqual(fresh.control()["mode"],"production")
+
+    def test_off_stops_new_sends_but_keeps_sync_path_available(self):
+        self.state.set_control("off","production")
+        result=self.agent.process_once()
+        self.assertEqual(result["sent"],0)
+        self.assertFalse(self.ref.claimed)
+
+    def test_pilot_limits_claim_batch(self):
+        self.state.set_control("on","pilot")
+        self.agent.config.claim_size=100
+        # FakeReference only returns one row, but the mode itself must persist.
+        self.assertEqual(self.state.control()["mode"],"pilot")
+        result=self.agent.process_once()
+        self.assertEqual(result["sent"],1)
 
     def test_adaptive_daily_cap_reaches_high_volume_after_warmup(self):
         config={
