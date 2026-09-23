@@ -1,92 +1,65 @@
-# Architecture — Rcvo Prospection Data V1
+# Architecture — Rcvo Prospection Data V2
 
-## 1. Frontières
+## Frontière stricte
 
-Cette couche n'est ni le SaaS Rcvo, ni Rcvo Mobile.
+Ce composant est autonome : stockage, code, processus, sauvegardes et futurs droits IAM propres. Il ne lit ni n'écrit la base du SaaS Rcvo.
 
-Elle constitue un système de données autonome qui pourra être déployé sur le même compte AWS, mais avec :
-- stockage propre ;
-- sauvegardes propres ;
-- processus propres ;
-- droits IAM propres ;
-- aucune dépendance à `rcvo.db`.
+## RAW : capture avant intelligence
 
-## 2. Zone RAW
+La priorité de RAW est de conserver vite et fidèlement ce qui a été acquis. Les contrôles métier et la déduplication contact/entreprise ne sont pas effectués sur le chemin critique d'ingestion.
 
-La zone RAW est volontairement permissive.
+Chaque entrée est rattachée à une source et un batch. Les fichiers/réponses originaux sont archivés par hash avant parsing. Les lignes valides deviennent `raw_records`; les éléments illisibles sont conservés dans `raw_ingest_failures`.
 
-### Tables principales
-- `raw_sources` : registre des fournisseurs/sources.
-- `raw_batches` : un import ou flux identifiable.
-- `raw_records` : payload JSON brut, une ligne par élément reçu.
-- `raw_batch_events` : début, fin et échec d'un import.
+Les tables supplémentaires V2 couvrent :
+- configurations de connecteurs sans secret en clair ;
+- artefacts bruts et liaison artefact/batch ;
+- runs de collecte réseau ;
+- checkpoints de pagination/reprise ;
+- métriques d'ingestion ;
+- leases et compteur de tentatives pour les workers du futur Agent SOURCING ;
+- maintenance et contrôles d'intégrité.
 
-### Choix de performance
-- WAL ;
-- `synchronous=NORMAL` ;
-- insertions `executemany` par lots ;
-- peu d'index ;
-- aucun contrôle de doublon bloquant à l'entrée ;
-- hash de payload optionnel et différable.
+## Connecteurs
 
-Une donnée n'est jamais rejetée uniquement parce qu'elle est pauvre. Le tri vient après la capture.
+Le connecteur HTTP est déclaratif. Un manifest décrit transport, auth, pagination, réponse et débit. Les secrets sont fournis par variables d'environnement.
 
-## 3. Base de référence Rcvo
+Auth supportée : Bearer/API-key header, API-key query, Basic, OAuth2 Client Credentials.
 
-### Entités
-- `organizations` ;
-- `organization_sites` ;
-- `contacts` ;
-- `contact_employments` ;
-- `contact_emails` ;
-- `contact_phones`.
+Pagination supportée : numéro de page, offset/limit, cursor, URL suivante.
 
-### Provenance et déduplication
-- `external_identities` : IDs Apollo/Hunter/autres, jamais utilisés comme ID maître ;
-- `source_observations` : provenance de chaque observation ;
-- `entity_merges` : journal des rapprochements/fusions ;
-- `data_events` : historique technique/fonctionnel générique.
+Formats supportés par le parseur commun : CSV/TSV/PSV, JSON/JSONL, XML, XLSX/XLS, HTML table, archives/compressions courantes, Parquet optionnel.
 
-### Prospection future
-- `campaigns` ;
-- `campaign_contacts` ;
-- `prospecting_events` ;
-- `prospecting_state` ;
-- `suppressions` ;
-- `suppression_events`.
+Le receiver webhook réutilise exactement le même pipeline RAW. Un adaptateur fournisseur spécifique pourra réutiliser `ingest_bytes` ou `ingest_parsed_records` sans modifier le schéma.
 
-L'historique de prospection est présent avant même l'Agent PROSPECTION afin d'éviter une migration structurante au moment où les premiers envois commenceront.
+## Idempotence et provenance
 
-## 4. Contact incomplet mais exploitable
+RAW n'empêche pas les doublons métier : deux fournisseurs peuvent légitimement fournir le même contact et le futur Agent SOURCING doit pouvoir comparer leurs observations.
 
-La complétude n'est pas une condition de stockage.
+En revanche, le même artefact binaire provenant de la même source possède un SHA-256 unique. Cela évite de retraiter accidentellement le même export plusieurs fois, tout en autorisant un retraitement explicite avec `--force`.
 
-Le NOM, le Prénom, l'entreprise et la ville sont des données recherchées et valorisées, mais non obligatoires. Un contact peut être exploitable dès lors que l'Agent SOURCING a suffisamment confiance dans son rattachement au marché VO et qu'un email utilisable est connu.
+## File de traitement
 
-La vue `v_prospectable_contacts` matérialise cette règle sans supprimer les contacts encore à enrichir.
+Le futur Agent SOURCING ne lira pas RAW avec un simple SELECT non coordonné. Il utilisera les leases :
+1. claim atomique d'un paquet ;
+2. bail expirant automatiquement ;
+3. ACK après promotion/traitement ;
+4. retry après erreur ;
+5. état terminal après un nombre maximal de tentatives.
 
-## 5. Historique
+Une panne du worker ne perd donc pas les données.
 
-Trois familles sont append-only :
-- observations de source ;
-- événements de prospection ;
-- événements d'exclusion.
+## Référence Rcvo
 
-Une correction s'effectue par un nouvel événement ou une nouvelle observation, jamais par réécriture silencieuse du passé.
+La base de référence reste séparée physiquement. Les entités Rcvo possèdent leurs propres IDs et conservent les identifiants fournisseurs comme références externes.
 
-Cela permet de répondre plus tard à :
-- Quand ce contact a-t-il été découvert ?
-- Par quelle source ?
-- Quand lui avons-nous écrit ?
-- Dans quelle campagne ?
-- Combien de fois ?
-- A-t-il répondu ou refusé ?
-- À partir de quand peut-il être réévalué pour une nouvelle campagne ?
+NOM, Prénom, entreprise et ville sont valorisés mais non bloquants. La qualification minimale pour la prospection reste indépendante de la complétude de la fiche.
 
-## 6. AWS cible
+## Historique de prospection
 
-Pour SQLite, la topologie recommandée est **un seul writer** sur un stockage bloc persistant, avec sauvegardes/snapshots. Les futurs agents ne devront pas monter chacun le même fichier SQLite via un partage réseau et écrire librement en concurrence.
+Campagnes, envois, relances, réponses, bounces, opt-out et dates de prochaine éligibilité ont leur structure dédiée. Les événements sensibles sont append-only.
 
-Si le besoin devient multi-writer, la frontière logique restera la même mais le moteur de la base de référence pourra migrer vers PostgreSQL.
+## AWS cible
 
-La zone RAW et la référence peuvent avoir des politiques de rétention/sauvegarde distinctes.
+Avec SQLite, le déploiement doit conserver un writer coordonné sur stockage bloc persistant. Les artefacts peuvent ensuite être externalisés vers S3 sans changer leur modèle logique.
+
+Si plusieurs agents doivent écrire réellement en parallèle à grande échelle, la frontière de données permet une migration de la référence vers PostgreSQL. Le pipeline d'ingestion, les IDs Rcvo et les événements restent conceptuellement identiques.

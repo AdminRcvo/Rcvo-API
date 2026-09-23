@@ -1,0 +1,42 @@
+{
+  "source_key": "provider-example",
+  "source_name": "Provider Example",
+  "source_kind": "provider_api",
+  "connector_key": "contacts",
+  "provider_url": "https://provider.example",
+  "url": "https://api.provider.example/v1/contacts",
+  "method": "GET",
+  "timeout_seconds": 60,
+  "headers": {
+    "Accept": "application/json"
+  },
+  "auth": {
+    "type": "bearer_env",
+    "env": "PROVIDER_API_TOKEN"
+  },
+  "response": {
+    "format": "json",
+    "records_path": "data.contacts"
+  },
+  "pagination": {
+    "type": "page",
+    "target": "query",
+    "param": "page",
+    "start": 1,
+    "page_size_param": "per_page",
+    "page_size": 100,
+    "max_pages": 100000,
+    "stop_on_short_page": true
+  },
+  "retry": {
+    "max_attempts": 7,
+    "backoff_seconds": 1,
+    "max_backoff_seconds": 60
+  },
+  "rate_limit": {
+    "min_interval_seconds": 0.25
+  },
+  "batch_size": 25000,
+  "id_field": "id",
+  "hash_payload": false
+}

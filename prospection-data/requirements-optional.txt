@@ -1,0 +1,3 @@
+# Optional adapters for less common supplier exports.
+# Install only when needed; the core ingestion engine does not require them.
+pyarrow>=17,<22
