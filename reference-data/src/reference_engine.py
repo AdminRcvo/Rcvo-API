@@ -758,87 +758,181 @@ def _employment(
         _observe(conn,raw,"employment",emp_id,field,observed,normalized_value,conf)
     return emp_id
 
-def promote(path: Path,payload: dict[str,Any]) -> dict[str,Any]:
-    init_db(path)
-    raw=payload.get("raw_ref") or {}
+def _prepare_raw(payload: dict[str,Any]) -> dict[str,Any]:
+    raw=dict(payload.get("raw_ref") or {})
     required=["source_key","raw_batch_uuid","raw_record_id"]
     missing=[x for x in required if raw.get(x) in (None,"")]
     if missing:
         raise ValueError("raw_ref missing: "+", ".join(missing))
     raw["raw_record_id"]=int(raw["raw_record_id"])
+    return raw
 
+def _promotion_rejection(
+    conn: sqlite3.Connection,
+    raw: dict[str,Any],
+    error: Exception | str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO promotion_events(
+            source_key,raw_batch_uuid,raw_record_id,event_type,occurred_at,details_json
+        ) VALUES (?,?,?,?,?,?)
+        """,
+        (
+            raw.get("source_key","unknown"),raw.get("raw_batch_uuid"),
+            raw.get("raw_record_id"),"promotion_rejected",utc_now(),
+            _json({"error":str(error)}),
+        ),
+    )
+
+def _promote_on_conn(
+    conn: sqlite3.Connection,
+    payload: dict[str,Any],
+) -> dict[str,Any]:
+    raw=_prepare_raw(payload)
+    receipt=conn.execute(
+        """
+        SELECT r.*,c.rcvo_id AS contact_rcvo_id,o.rcvo_id AS organization_rcvo_id
+        FROM promotion_receipts r
+        LEFT JOIN contacts c ON c.id=r.contact_id
+        LEFT JOIN organizations o ON o.id=r.organization_id
+        WHERE r.source_key=? AND r.raw_batch_uuid=? AND r.raw_record_id=?
+        """,
+        (raw["source_key"],raw["raw_batch_uuid"],raw["raw_record_id"]),
+    ).fetchone()
+    if receipt:
+        return {
+            "idempotent":True,
+            "status":receipt["result_status"],
+            "contact_rcvo_id":receipt["contact_rcvo_id"],
+            "organization_rcvo_id":receipt["organization_rcvo_id"],
+        }
+
+    _event(conn,raw,"promotion_started",details={"source_record_id":raw.get("source_record_id")})
+    org_id,org_rcvo,org_created=_organization(conn,raw,payload)
+    site_id,site_rcvo=_site(conn,raw,payload,org_id)
+    contact_id,contact_rcvo,contact_created=_contact(conn,raw,payload)
+    _email(conn,raw,payload,contact_id)
+    _phone(conn,raw,payload,contact_id)
+    _employment(conn,raw,payload,contact_id,org_id,site_id)
+
+    status="created" if (contact_created or org_created) else "enriched"
+    conn.execute(
+        """
+        INSERT INTO promotion_receipts(
+            source_key,raw_batch_uuid,raw_record_id,source_record_id,promoted_at,
+            result_status,contact_id,organization_id,details_json
+        ) VALUES (?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            raw["source_key"],raw["raw_batch_uuid"],raw["raw_record_id"],
+            _clean(raw.get("source_record_id")),utc_now(),status,contact_id,org_id,
+            _json({"site_rcvo_id":site_rcvo}),
+        ),
+    )
+    _event(
+        conn,raw,"promotion_completed",
+        contact_id=contact_id,organization_id=org_id,details={"status":status}
+    )
+    return {
+        "idempotent":False,
+        "status":status,
+        "contact_rcvo_id":contact_rcvo,
+        "organization_rcvo_id":org_rcvo,
+        "site_rcvo_id":site_rcvo,
+    }
+
+def promote(path: Path,payload: dict[str,Any]) -> dict[str,Any]:
+    init_db(path)
+    raw=None
     conn=connect(path)
     try:
+        raw=_prepare_raw(payload)
         conn.execute("BEGIN IMMEDIATE")
-        receipt=conn.execute(
-            """
-            SELECT r.*,c.rcvo_id AS contact_rcvo_id,o.rcvo_id AS organization_rcvo_id
-            FROM promotion_receipts r
-            LEFT JOIN contacts c ON c.id=r.contact_id
-            LEFT JOIN organizations o ON o.id=r.organization_id
-            WHERE r.source_key=? AND r.raw_batch_uuid=? AND r.raw_record_id=?
-            """,
-            (raw["source_key"],raw["raw_batch_uuid"],raw["raw_record_id"]),
-        ).fetchone()
-        if receipt:
-            conn.rollback()
-            return {
-                "idempotent":True,
-                "status":receipt["result_status"],
-                "contact_rcvo_id":receipt["contact_rcvo_id"],
-                "organization_rcvo_id":receipt["organization_rcvo_id"],
-            }
-
-        _event(conn,raw,"promotion_started",details={"source_record_id":raw.get("source_record_id")})
-        org_id,org_rcvo,org_created=_organization(conn,raw,payload)
-        site_id,site_rcvo=_site(conn,raw,payload,org_id)
-        contact_id,contact_rcvo,contact_created=_contact(conn,raw,payload)
-        _email(conn,raw,payload,contact_id)
-        _phone(conn,raw,payload,contact_id)
-        _employment(conn,raw,payload,contact_id,org_id,site_id)
-
-        if contact_created or org_created:
-            status="created"
-        else:
-            status="enriched"
-        conn.execute(
-            """
-            INSERT INTO promotion_receipts(
-                source_key,raw_batch_uuid,raw_record_id,source_record_id,promoted_at,
-                result_status,contact_id,organization_id,details_json
-            ) VALUES (?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                raw["source_key"],raw["raw_batch_uuid"],raw["raw_record_id"],
-                _clean(raw.get("source_record_id")),utc_now(),status,contact_id,org_id,
-                _json({"site_rcvo_id":site_rcvo}),
-            ),
-        )
-        _event(conn,raw,"promotion_completed",contact_id=contact_id,organization_id=org_id,details={"status":status})
+        result=_promote_on_conn(conn,payload)
         conn.commit()
-        return {
-            "idempotent":False,
-            "status":status,
-            "contact_rcvo_id":contact_rcvo,
-            "organization_rcvo_id":org_rcvo,
-            "site_rcvo_id":site_rcvo,
-        }
+        return result
     except Exception as exc:
         conn.rollback()
+        if raw is None:
+            try:
+                raw=_prepare_raw(payload)
+            except Exception:
+                raw={"source_key":"unknown","raw_batch_uuid":None,"raw_record_id":None}
         try:
-            with connect(path) as audit:
-                audit.execute(
-                    """
-                    INSERT INTO promotion_events(
-                        source_key,raw_batch_uuid,raw_record_id,event_type,occurred_at,details_json
-                    ) VALUES (?,?,?,?,?,?)
-                    """,
-                    (
-                        raw.get("source_key","unknown"),raw.get("raw_batch_uuid"),
-                        raw.get("raw_record_id"),"promotion_rejected",utc_now(),
-                        _json({"error":str(exc)}),
-                    ),
-                )
+            conn.execute("BEGIN IMMEDIATE")
+            _promotion_rejection(conn,raw,exc)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def promote_many(
+    path: Path,
+    payloads,
+    *,
+    batch_size: int=500,
+    continue_on_error: bool=True,
+) -> dict[str,Any]:
+    if batch_size<1:
+        raise ValueError("batch_size must be >= 1")
+    init_db(path)
+    conn=connect(path)
+    total=created=enriched=idempotent=failed=0
+    errors=[]
+    in_batch=0
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for index,payload in enumerate(payloads,start=1):
+            total+=1
+            conn.execute("SAVEPOINT rcvo_item")
+            raw=None
+            try:
+                raw=_prepare_raw(payload)
+                result=_promote_on_conn(conn,payload)
+                conn.execute("RELEASE SAVEPOINT rcvo_item")
+                if result.get("idempotent"):
+                    idempotent+=1
+                elif result.get("status")=="created":
+                    created+=1
+                else:
+                    enriched+=1
+            except Exception as exc:
+                conn.execute("ROLLBACK TO SAVEPOINT rcvo_item")
+                conn.execute("RELEASE SAVEPOINT rcvo_item")
+                failed+=1
+                if raw is None:
+                    try:
+                        raw=_prepare_raw(payload)
+                    except Exception:
+                        raw={"source_key":"unknown","raw_batch_uuid":None,"raw_record_id":None}
+                try:
+                    _promotion_rejection(conn,raw,exc)
+                except Exception:
+                    pass
+                errors.append({"index":index,"error":str(exc)})
+                if not continue_on_error:
+                    conn.rollback()
+                    raise
+            in_batch+=1
+            if in_batch>=batch_size:
+                conn.commit()
+                conn.execute("BEGIN IMMEDIATE")
+                in_batch=0
+        conn.commit()
+        return {
+            "total":total,
+            "created":created,
+            "enriched":enriched,
+            "idempotent":idempotent,
+            "failed":failed,
+            "errors":errors[:100],
+        }
+    except Exception:
+        try:
+            conn.rollback()
         except Exception:
             pass
         raise

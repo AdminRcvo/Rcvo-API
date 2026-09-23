@@ -9,7 +9,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/"src"))
 
 from reference_engine import (
-    add_suppression, connect, init_db, promote, record_prospecting_event, stats
+    add_suppression, connect, init_db, promote, promote_many, record_prospecting_event, stats
 )
 
 def payload(
@@ -356,6 +356,24 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(len(master),1)
         self.assertEqual(len(prospectable),1)
         self.assertEqual(master[0]["job_role"],"responsable_vo")
+
+    def test_bulk_promotion_is_atomic_per_item_and_continues(self):
+        good1=payload(100,email="bulk1@dealer.fr")
+        bad=payload(101,email="same@dealer.fr")
+        good2=payload(102,email="bulk2@dealer.fr")
+        promote(self.db,payload(99,email="same@dealer.fr"))
+        bad["contact_match_rcvo_id"]="CNT-DOES-NOT-EXIST"
+        result=promote_many(
+            self.db,[good1,bad,good2],
+            batch_size=2,
+            continue_on_error=True,
+        )
+        self.assertEqual(result["total"],3)
+        self.assertEqual(result["failed"],1)
+        with connect(self.db) as conn:
+            emails={r[0] for r in conn.execute("SELECT email_norm FROM contact_emails")}
+        self.assertIn("bulk1@dealer.fr",emails)
+        self.assertIn("bulk2@dealer.fr",emails)
 
     def test_integrity_and_stats(self):
         promote(self.db,payload(1))

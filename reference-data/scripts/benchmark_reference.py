@@ -11,7 +11,7 @@ import sys
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/"src"))
 
-from reference_engine import promote
+from reference_engine import promote_many
 
 def make_payload(i:int) -> dict:
     return {
@@ -57,11 +57,16 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         db=Path(tmp)/"reference.sqlite"
         start=time.perf_counter()
-        for i in range(args.rows):
-            promote(db,make_payload(i))
+        result=promote_many(
+            db,
+            (make_payload(i) for i in range(args.rows)),
+            batch_size=500,
+            continue_on_error=False,
+        )
         elapsed=time.perf_counter()-start
         print(json.dumps({
             "rows":args.rows,
+            "failed":result["failed"],
             "elapsed_seconds":round(elapsed,3),
             "rows_per_second":round(args.rows/elapsed if elapsed else 0),
         },indent=2))

@@ -5,7 +5,7 @@ import argparse
 import json
 from pathlib import Path
 
-from reference_engine import add_suppression, connect, init_db, promote, stats
+from reference_engine import add_suppression, connect, init_db, promote, promote_many, stats
 
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -55,20 +55,29 @@ def main(argv=None) -> int:
         print(json.dumps(promote(args.db,payload),ensure_ascii=False,indent=2))
         return 0
     if args.command=="promote-jsonl":
-        ok=failed=0
-        with args.file.open("r",encoding="utf-8-sig") as fh:
-            for line_no,line in enumerate(fh,start=1):
-                if not line.strip():
-                    continue
-                try:
-                    promote(args.db,json.loads(line))
-                    ok+=1
-                except Exception as exc:
-                    failed+=1
-                    print(json.dumps({"line":line_no,"error":str(exc)},ensure_ascii=False))
-                    if not args.continue_on_error:
-                        raise
-        print(json.dumps({"promoted":ok,"failed":failed},indent=2))
+        def records():
+            with args.file.open("r",encoding="utf-8-sig") as fh:
+                for line_no,line in enumerate(fh,start=1):
+                    if not line.strip():
+                        continue
+                    try:
+                        yield json.loads(line)
+                    except Exception as exc:
+                        if not args.continue_on_error:
+                            raise
+                        yield {
+                            "raw_ref":{
+                                "source_key":"jsonl-parse-error",
+                                "raw_batch_uuid":args.file.name,
+                                "raw_record_id":line_no
+                            },
+                            "__invalid__":str(exc)
+                        }
+        result=promote_many(
+            args.db,records(),
+            continue_on_error=args.continue_on_error,
+        )
+        print(json.dumps(result,ensure_ascii=False,indent=2))
         return 0
     if args.command=="prospectable":
         init_db(args.db)
